@@ -1,0 +1,30 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.env
+.venv
+env/
+venv/
+
+# Modelos descargados por faster-whisper (pueden pesar varios GB)
+# Se descargan automáticamente al ejecutar la app
+models/
+
+# Transcripciones guardadas
+opentralla_*.txt
+opentralla_*.wav
+opentralla_*.mp4
+
+# Configuración local (API keys) — nunca subir al repositorio
+config.json
+
+# Binarios descargados / Logs de error temporales
+ffmpeg.exe
+ffmpeg_tmp.zip
+ffmpeg_tmp/
+error_screen.log
