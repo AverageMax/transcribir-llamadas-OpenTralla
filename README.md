@@ -168,6 +168,7 @@ Para mejorar la diarización: asegúrate de que tu micrófono esté configurado 
 | Solo captura un lado | Verifica el micrófono en → Configuración de Windows → Sonido |
 | Modelo lento | Usa `small` (defecto) o un modelo aun menor como `tiny` |
 | Error de API IA | Verifica que la clave sea válida y que instalaste la librería |
+| Se detiene o "cuelga" en llamadas largas (o al usar audífonos Bluetooth) | Windows aveces desconecta el audio por un milisegundo. Agregué un parche de "auto-sanación" al código para que OpenTralla lo detecte, reconecte el audio por debajo en 1 segundo y siga grabando la llamada automáticamente sin que te des cuenta. |
 
 ---
 

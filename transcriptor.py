@@ -120,9 +120,10 @@ def _abrir(pa, dev, frames):
 
 def _leer(st, frames, ch, rate):
     try:
-        return raw_to_f32(st.read(frames, exception_on_overflow=False), ch, rate)
+        data = st.read(frames, exception_on_overflow=False)
+        return raw_to_f32(data, ch, rate), False
     except OSError:
-        return np.zeros(0, dtype=np.float32)
+        return np.zeros(0, dtype=np.float32), True
 
 
 # ─── Captura + VAD + Diarización ──────────────────────────────────────────────
@@ -168,20 +169,42 @@ def hilo_captura(status_cb, rms_cb):
         # Diarización: acumular RMS de cada stream por frase
         rms_loop_acc = []
         rms_mic_acc  = []
+        consecutive_errors = 0
 
         while not stop_event.is_set():
-            loop_c = _leer(st_loop, CHUNK_FRAMES, ch_l, rate_l)
+            loop_c, err1 = _leer(st_loop, CHUNK_FRAMES, ch_l, rate_l)
             rms_loop_now = rms(loop_c)
 
             if mic_ok:
-                mic_c = _leer(st_mic, CHUNK_FRAMES, ch_m, rate_m)
+                mic_c, err2 = _leer(st_mic, CHUNK_FRAMES, ch_m, rate_m)
                 rms_mic_now = rms(mic_c)
                 n     = min(len(loop_c), len(mic_c))
                 mixed = (np.clip(loop_c[:n]*0.6 + mic_c[:n]*0.8, -1, 1).astype(np.float32)
                          if n > 0 else loop_c)
             else:
-                mic_c, rms_mic_now = np.zeros(0, dtype=np.float32), 0.0
+                mic_c, rms_mic_now, err2 = np.zeros(0, dtype=np.float32), 0.0, False
                 mixed = loop_c
+
+            if err1 or err2:
+                consecutive_errors += 1
+                if consecutive_errors > 20: # ~2 segundos de errores continuos
+                    status_cb("⚠️ Reiniciando sistema de audio (desconexión detectada)...")
+                    try:
+                        st_loop.stop_stream(); st_loop.close()
+                        if mic_ok: st_mic.stop_stream(); st_mic.close()
+                    except: pass
+                    import time
+                    time.sleep(1) # pausa breve para que el driver OS se recupere
+                    try:
+                        st_loop, ch_l, rate_l = _abrir(pa, dev_loop, CHUNK_FRAMES)
+                        if mic_ok: st_mic, ch_m, rate_m = _abrir(pa, dev_mic, CHUNK_FRAMES)
+                        consecutive_errors = 0
+                        status_cb("✅ Sistema de audio recuperado.")
+                    except Exception as e:
+                        status_cb(f"❌ Error fatal al recuperar audio: {e}")
+                        break
+            else:
+                consecutive_errors = 0
 
             if len(mixed) == 0:
                 continue
