@@ -177,10 +177,20 @@ def hilo_captura(status_cb, rms_cb):
 
             if mic_ok:
                 mic_c, err2 = _leer(st_mic, CHUNK_FRAMES, ch_m, rate_m)
-                rms_mic_now = rms(mic_c)
-                n     = min(len(loop_c), len(mic_c))
-                mixed = (np.clip(loop_c[:n]*0.6 + mic_c[:n]*0.8, -1, 1).astype(np.float32)
-                         if n > 0 else loop_c)
+                n = min(len(loop_c), len(mic_c))
+                if n > 0:
+                    # Cancelación de eco por sustracción:
+                    # El micrófono del laptop capta TU voz + eco del parlante (la voz del otro).
+                    # Restamos la señal del loopback (lo que sale por el parlante) del micrófono
+                    # para quedarnos solo con TU voz limpia, sin eco.
+                    mic_limpio = mic_c[:n] - loop_c[:n] * 0.5
+                    mic_limpio = np.clip(mic_limpio, -1, 1).astype(np.float32)
+                    rms_mic_now = rms(mic_limpio)
+                    # Mezcla final: loopback (voz del otro) + micrófono limpio (tu voz sin eco)
+                    mixed = np.clip(loop_c[:n]*0.6 + mic_limpio*0.8, -1, 1).astype(np.float32)
+                else:
+                    rms_mic_now = rms(mic_c)
+                    mixed = loop_c
             else:
                 mic_c, rms_mic_now, err2 = np.zeros(0, dtype=np.float32), 0.0, False
                 mixed = loop_c

@@ -169,6 +169,7 @@ Para mejorar la diarización: asegúrate de que tu micrófono esté configurado 
 | Modelo lento | Usa `small` (defecto) o un modelo aun menor como `tiny` |
 | Error de API IA | Verifica que la clave sea válida y que instalaste la librería |
 | Se detiene o "cuelga" en llamadas largas (o al usar audífonos Bluetooth) | Windows aveces desconecta el audio por un milisegundo. Agregué un parche de "auto-sanación" al código para que OpenTralla lo detecte, reconecte el audio por debajo en 1 segundo y siga grabando la llamada automáticamente sin que te des cuenta. |
+| La otra persona escucha eco o ruido al usar parlantes del laptop | Implementé cancelación de eco por sustracción: OpenTralla resta la señal del parlante de la señal del micrófono para eliminar el eco. Si persiste, usa audífonos para aislar completamente el micrófono del parlante. |
 
 ---
 
