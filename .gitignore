@@ -19,6 +19,10 @@ models/
 opentralla_*.txt
 opentralla_*.wav
 opentralla_*.mp4
+opentralla_*.json
+
+# Auto-guardado (transcripciones temporales anti-pérdida)
+_autosave/
 
 # Configuración local (API keys) — nunca subir al repositorio
 config.json
