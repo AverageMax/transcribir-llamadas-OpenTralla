@@ -1121,14 +1121,9 @@ class TranscriptorApp:
                 ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                 path = os.path.join(AUTOSAVE_DIR, f"autosave_{ts}.txt")
                 
-                # Guardar transcripción con formato profesional
+                # Guardar solo la transcripción en texto
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(self._generar_transcripcion_formateada())
-                
-                # Guardar JSON estructurado
-                json_path = os.path.join(AUTOSAVE_DIR, f"autosave_{ts}.json")
-                with open(json_path, "w", encoding="utf-8") as f:
-                    json.dump(self._generar_json_estructurado(), f, ensure_ascii=False, indent=2)
                 
                 # Limpiar auto-guardados viejos (mantener solo los últimos 3)
                 self._limpiar_autosaves_viejos()
@@ -1143,14 +1138,11 @@ class TranscriptorApp:
         """Mantiene solo los últimos 3 auto-guardados para no llenar el disco."""
         try:
             archivos = sorted(
-                [f for f in os.listdir(AUTOSAVE_DIR) if f.startswith("autosave_")],
+                [f for f in os.listdir(AUTOSAVE_DIR) if f.startswith("autosave_") and f.endswith(".txt")],
                 reverse=True
             )
-            # Agrupar por extensión y mantener los últimos 3 de cada tipo
-            for ext in [".txt", ".json"]:
-                ext_files = [f for f in archivos if f.endswith(ext)]
-                for old in ext_files[3:]:
-                    os.remove(os.path.join(AUTOSAVE_DIR, old))
+            for old in archivos[3:]:
+                os.remove(os.path.join(AUTOSAVE_DIR, old))
         except Exception:
             pass
     
@@ -1336,51 +1328,29 @@ class TranscriptorApp:
         
         base = os.path.splitext(path)[0]
 
-        # 1. Transcripción formateada profesionalmente
+        # 1. Transcripción formateada (.txt)
         with open(path, "w", encoding="utf-8") as f:
             f.write(self._generar_transcripcion_formateada())
-        
-        # 2. JSON estructurado
-        json_path = base + ".json"
-        try:
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(self._generar_json_estructurado(), f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"Error guardando JSON: {e}")
 
-        # 3. Audio separado — 3 archivos WAV (como hacen las empresas profesionales)
-        ok_wav_loop = self._guardar_wav_separado(base + "_ellos.wav", audio_buf_loop, native_rate_loop)
-        ok_wav_mic  = self._guardar_wav_separado(base + "_tu.wav", audio_buf_mic, native_rate_mic)
-        
-        # 4. WAV dual-channel estéreo (Tú=izquierdo, Ellos=derecho)
-        #    Esto es exactamente como lo hace Twilio con RecordingChannels=dual
-        ok_wav_dual = self._guardar_wav_dual_channel(base + "_dual.wav")
-        
-        # 5. WAV mixto (ambos combinados, para referencia rápida)
-        ok_wav_mix = self._guardar_wav_mixto(base + "_mixto.wav")
+        # 2. Audio completo de la llamada (.wav) — mezcla de ambos canales
+        wav_path = base + ".wav"
+        ok_wav = self._guardar_wav_mixto(wav_path)
 
-        # 6. Video (si hay grabación de pantalla)
+        # 3. Video (.mp4) — SOLO si la grabación de pantalla estaba activa
         ok_mp4, mp4_path = False, ""
         if self._screen_rec and self._screen_rec.video_path and os.path.exists(self._screen_rec.video_path):
             mp4_path = base + ".mp4"
-            wav_mix = base + "_mixto.wav"
-            if os.path.exists(wav_mix):
-                ok_mp4 = self._muxear_video(self._screen_rec.video_path, wav_mix, mp4_path)
+            if os.path.exists(wav_path):
+                ok_mp4 = self._muxear_video(self._screen_rec.video_path, wav_path, mp4_path)
 
-        msg = f"📄 Transcripción:\n{path}\n\n📊 JSON:\n{json_path}"
-        if ok_wav_mic:
-            msg += f"\n\n🎤 Tu voz:\n{base}_tu.wav"
-        if ok_wav_loop:
-            msg += f"\n\n🔊 Ellos:\n{base}_ellos.wav"
-        if ok_wav_dual:
-            msg += f"\n\n🎧 Dual-channel (L=Tú R=Ellos):\n{base}_dual.wav"
-        if ok_wav_mix:
-            msg += f"\n\n🔀 Mixto:\n{base}_mixto.wav"
+        msg = f"📄 Transcripción:\n{path}"
+        if ok_wav:
+            msg += f"\n\n🔊 Audio de la llamada:\n{wav_path}"
         if ok_mp4:
-            msg += f"\n\n🎬 Video:\n{mp4_path}"
+            msg += f"\n\n🎬 Video con pantalla:\n{mp4_path}"
         elif self._screen_rec:
             msg += "\n\n⚠️ No se pudo generar el video (verifica que ffmpeg.exe esté en la carpeta)"
-        messagebox.showinfo("Guardado Profesional", msg)
+        messagebox.showinfo("Guardado", msg)
 
     def _guardar_wav_separado(self, path: str, buf: list, rate: int) -> bool:
         """Guarda un stream de audio individual como WAV a su tasa nativa."""
