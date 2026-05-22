@@ -15,25 +15,29 @@ echo.
 
 python -m pip install --upgrade pip --quiet
 
-echo  [1/6] Instalando numpy...
+echo  [1/7] Instalando numpy...
 pip install numpy --quiet
 if %errorlevel% neq 0 ( echo  ERROR instalando numpy & pause & exit /b 1 )
 
-echo  [2/6] Instalando PyAudioWPatch (captura WASAPI loopback)...
+echo  [2/7] Instalando PyAudioWPatch (captura WASAPI loopback)...
 pip install pyaudiowpatch --quiet
 if %errorlevel% neq 0 ( echo  ERROR instalando pyaudiowpatch & pause & exit /b 1 )
 
-echo  [3/6] Instalando faster-whisper (motor de transcripcion)...
+echo  [3/7] Instalando faster-whisper (motor de transcripcion)...
 pip install faster-whisper --quiet
 if %errorlevel% neq 0 ( echo  ERROR instalando faster-whisper & pause & exit /b 1 )
 
-echo  [4/6] Instalando mss (captura de pantalla)...
+echo  [4/7] Instalando httpx compatible con Python 3.13+ (sin modulo cgi)...
+pip install "httpx>=0.27.0" --quiet
+if %errorlevel% neq 0 ( echo  ERROR instalando httpx & pause & exit /b 1 )
+
+echo  [5/7] Instalando mss (captura de pantalla)...
 pip install mss --quiet
 
-echo  [5/6] Instalando opencv-python (codificacion de video)...
+echo  [6/7] Instalando opencv-python (codificacion de video)...
 pip install opencv-python --quiet
 
-echo  [6/6] Verificando ffmpeg...
+echo  [7/7] Verificando ffmpeg...
 if exist "%~dp0ffmpeg.exe" (
     echo  OK ffmpeg.exe ya existe en la carpeta del proyecto.
     goto :instalar_ok
@@ -81,7 +85,7 @@ echo  ║                                                      ║
 echo  ║   Ahora ejecuta:  iniciar.bat                        ║
 echo  ╚══════════════════════════════════════════════════════╝
 echo.
-echo  NOTA: El modelo Whisper (~1.5 GB) se descargara
+echo  NOTA: El modelo Whisper (~500 MB para 'small') se descargara
 echo  automaticamente la primera vez que abras la app.
 echo  Solo necesitas internet esa primera vez.
 echo.
