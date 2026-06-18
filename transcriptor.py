@@ -26,21 +26,16 @@ if _user_site not in sys.path:
 
 try:
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("OpenTralla.Transcriptor.1")
+    # Establecer prioridad del proceso a BELOW_NORMAL_PRIORITY_CLASS (0x00004000)
+    # Esto asegura que Zoom/Teams/Discord y el motor de audio tengan prioridad sobre Whisper en CPU
+    ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x00004000)
 except Exception:
     pass
 
-# ─── Elevar prioridad del proceso para audio en tiempo real ───────────────────
-try:
-    import psutil
-    psutil.Process().nice(psutil.HIGH_PRIORITY_CLASS)
-except Exception:
-    # Sin psutil, intentar con ctypes directamente
-    try:
-        kernel32 = ctypes.windll.kernel32
-        handle = kernel32.GetCurrentProcess()
-        kernel32.SetPriorityClass(handle, 0x00000080)  # HIGH_PRIORITY_CLASS
-    except Exception:
-        pass
+# Nota: No elevamos la prioridad del proceso entero a HIGH para evitar
+# que el procesamiento pesado de Whisper en CPU sature el sistema y
+# degrade el audio en aplicaciones de videollamada como Zoom o Teams.
+
 
 import tkinter as tk
 from tkinter import scrolledtext, filedialog, messagebox, ttk
@@ -63,44 +58,10 @@ if MISSING:
                          f"Faltan: {', '.join(MISSING)}\n\nEjecuta: instalar.bat")
     sys.exit(1)
 
-# ─── Parámetros ────────────────────────────────────────────────────────────────
-WHISPER_RATE   = 16000                  # Tasa que Whisper necesita (solo para transcripción)
-CHUNK_FRAMES   = 2048                   # Buffer grande = sin chasquidos (era 512 → underruns)
-# Opciones de MODEL_SIZE (de menor a mayor precisión y consumo de recursos):
-# "tiny"     : ~39 M params  (super rápido, menos preciso, uso bajísimo de RAM/VRAM)
-# "base"     : ~74 M params  (buen balance para pruebas rápidas)
-# "small"    : ~244 M params (balance ideal velocidad/precisión para la mayoría) ← RECOMENDADO PARA CPU
-# "medium"   : ~769 M params (alta precisión, necesita GPU para ser fluido en tiempo real)
-# "large-v2" : ~1550 M params (precisión casi perfecta, requiere GPU NVIDIA)
-# "large-v3" : ~1550 M params (el más avanzado y exacto de OpenAI, requiere GPU NVIDIA)
-MODEL_SIZE     = "small"                # "small" = fluido en CPU | "medium" = necesita GPU
-LANGUAGE       = "es"
-
-SILENCE_SEC    = 0.8                    # Segundos de silencio para cortar frase
-MIN_SPEECH_SEC = 0.3                    # Mínimo de voz para considerar frase
-MAX_PHRASE_SEC = 25                     # Máximo antes de forzar corte
-SILENCE_THRESH = 0.003                  # Umbral VAD por defecto
-FADE_IN_MS     = 15                     # Duración del fade-in anti-pop (ms)
-AUTOSAVE_INTERVAL = 30                  # Segundos entre auto-guardados
-
+# ─── Config y parámetros ────────────────────────────────────────────────────────
 CONFIG_FILE    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 AUTOSAVE_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_autosave")
 
-# ─── Estado global ─────────────────────────────────────────────────────────────
-phrase_queue: queue.Queue = queue.Queue()   # items: (audio_f32_16k, speaker_label)
-stop_event    = threading.Event()
-model_ready   = threading.Event()
-whisper_model = None
-silence_thresh_dynamic = SILENCE_THRESH
-
-# Buffers de audio separados (calidad profesional: streams independientes)
-audio_buf_mic:  list = []     # Solo tu voz (micrófono)
-audio_buf_loop: list = []     # Solo ellos (loopback/sistema)
-native_rate_loop: int = 48000 # Se actualiza al detectar dispositivo
-native_rate_mic:  int = 48000
-
-
-# ─── Config (API keys) ─────────────────────────────────────────────────────────
 def load_config() -> dict:
     if os.path.exists(CONFIG_FILE):
         try:
@@ -117,15 +78,64 @@ def save_config(cfg: dict):
     except Exception:
         pass
 
+_cfg = load_config()
+MODEL_SIZE     = _cfg.get("whisper_model_size", "small")
+WHISPER_THREADS = _cfg.get("whisper_cpu_threads", 2)
+USAR_MIC        = _cfg.get("usar_mic", True)
+
+WHISPER_RATE   = 16000                  # Tasa que Whisper necesita (solo para transcripción)
+CHUNK_FRAMES   = 2048                   # Buffer grande = sin chasquidos (era 512 → underruns)
+LANGUAGE       = "es"
+
+SILENCE_SEC    = 0.8                    # Segundos de silencio para cortar frase
+MIN_SPEECH_SEC = 0.3                    # Mínimo de voz para considerar frase
+MAX_PHRASE_SEC = 25                     # Máximo antes de forzar corte
+SILENCE_THRESH = 0.003                  # Umbral VAD por defecto
+FADE_IN_MS     = 15                     # Duración del fade-in anti-pop (ms)
+AUTOSAVE_INTERVAL = 30                  # Segundos entre auto-guardados
+
+# ─── Estado global ─────────────────────────────────────────────────────────────
+phrase_queue: queue.Queue = queue.Queue()   # items: (audio_f32_16k, speaker_label)
+stop_event    = threading.Event()
+model_ready   = threading.Event()
+whisper_model = None
+silence_thresh_dynamic = SILENCE_THRESH
+
+# Buffers de audio separados (calidad profesional: streams independientes)
+audio_buf_mic:  list = []     # Solo tu voz (micrófono)
+audio_buf_loop: list = []     # Solo ellos (loopback/sistema)
+native_rate_loop: int = 48000 # Se actualiza al detectar dispositivo
+native_rate_mic:  int = 48000
+
 
 # ─── Modelo ───────────────────────────────────────────────────────────────────
+def get_whisper_device() -> tuple:
+    """Detecta si CUDA está disponible en ctranslate2 para usar GPU."""
+    try:
+        import ctranslate2
+        if ctranslate2.get_cuda_device_count() > 0:
+            return "cuda", "float16"
+    except Exception:
+        pass
+    return "cpu", "int8"
+
 def cargar_modelo(status_cb):
     global whisper_model
+    model_ready.clear()
     status_cb(f"⏳ Cargando modelo '{MODEL_SIZE}'…")
     try:
-        whisper_model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
+        # Detectar si hay CUDA disponible en ctranslate2
+        device, compute_type = get_whisper_device()
+        
+        if device == "cuda":
+            status_cb(f"⏳ Cargando modelo '{MODEL_SIZE}' en GPU (CUDA)…")
+            whisper_model = WhisperModel(MODEL_SIZE, device="cuda", compute_type=compute_type)
+        else:
+            status_cb(f"⏳ Cargando modelo '{MODEL_SIZE}' en CPU ({WHISPER_THREADS} hilos)…")
+            whisper_model = WhisperModel(MODEL_SIZE, device="cpu", compute_type=compute_type, cpu_threads=WHISPER_THREADS)
+            
         model_ready.set()
-        status_cb(f"✅ Modelo '{MODEL_SIZE}' listo — Presiona Iniciar")
+        status_cb(f"✅ Modelo '{MODEL_SIZE}' listo ({device.upper()})")
     except Exception as e:
         status_cb(f"❌ Error cargando modelo: {e}")
 
@@ -181,9 +191,10 @@ class AudioCaptureEngine:
     - Se mantiene la tasa nativa del dispositivo para máxima calidad
     """
     
-    def __init__(self, status_cb, rms_cb):
+    def __init__(self, status_cb, rms_cb, usar_mic=True):
         self.status_cb = status_cb
         self.rms_cb = rms_cb
+        self.usar_mic = usar_mic
         self.pa = None
         self.stream_loop = None
         self.stream_mic = None
@@ -253,26 +264,45 @@ class AudioCaptureEngine:
         )
         
         # ── Micrófono (tu voz) ──
-        try:
-            dev_mic = self.pa.get_device_info_by_index(
-                self.pa.get_default_input_device_info()["index"])
-            
-            self.ch_m  = min(int(dev_mic.get("maxInputChannels", 1)) or 1, 2)
-            self.rate_m = int(dev_mic.get("defaultSampleRate", 48000))
-            native_rate_mic = self.rate_m
-            
-            self.stream_mic = self.pa.open(
-                format=pyaudio.paInt16,
-                channels=self.ch_m,
-                rate=self.rate_m,
-                input=True,
-                input_device_index=int(dev_mic["index"]),
-                frames_per_buffer=CHUNK_FRAMES,
-                stream_callback=self._cb_mic  # ← MODO CALLBACK
-            )
-            self.mic_ok = True
-            self.status_cb(f"🎤+🔊 Mic ({self.rate_m}Hz) + Sistema ({self.rate_l}Hz) | Captura profesional activa")
-        except Exception:
+        if self.usar_mic:
+            try:
+                dev_mic = None
+                # Intentar buscar el micrófono por defecto en la API de WASAPI para evitar mezclar APIs y causar distorsión
+                for i in range(self.pa.get_host_api_count()):
+                    info = self.pa.get_host_api_info_by_index(i)
+                    if info.get("type") == 13 or "WASAPI" in info.get("name", ""):
+                        dev_idx = info.get("defaultInputDevice")
+                        if dev_idx is not None and dev_idx >= 0:
+                            try:
+                                dev_mic = self.pa.get_device_info_by_index(dev_idx)
+                            except Exception:
+                                pass
+                        break
+                
+                # Fallback
+                if not dev_mic:
+                    dev_mic = self.pa.get_device_info_by_index(
+                        self.pa.get_default_input_device_info()["index"])
+                
+                self.ch_m  = min(int(dev_mic.get("maxInputChannels", 1)) or 1, 2)
+                self.rate_m = int(dev_mic.get("defaultSampleRate", 48000))
+                native_rate_mic = self.rate_m
+                
+                self.stream_mic = self.pa.open(
+                    format=pyaudio.paInt16,
+                    channels=self.ch_m,
+                    rate=self.rate_m,
+                    input=True,
+                    input_device_index=int(dev_mic["index"]),
+                    frames_per_buffer=CHUNK_FRAMES,
+                    stream_callback=self._cb_mic  # ← MODO CALLBACK
+                )
+                self.mic_ok = True
+                self.status_cb(f"🎤+🔊 Mic ({self.rate_m}Hz) + Sistema ({self.rate_l}Hz) | Captura profesional activa")
+            except Exception:
+                self.mic_ok = False
+                self.status_cb(f"🔊 Solo sistema ({self.rate_l}Hz) | Captura profesional activa")
+        else:
             self.mic_ok = False
             self.status_cb(f"🔊 Solo sistema ({self.rate_l}Hz) | Captura profesional activa")
     
@@ -324,7 +354,7 @@ class AudioCaptureEngine:
                 pass
 
 
-def hilo_captura(status_cb, rms_cb):
+def hilo_captura(status_cb, rms_cb, usar_mic=True):
     """Hilo principal de captura, VAD y diarización.
     
     Arquitectura profesional (tipo call center):
@@ -335,7 +365,7 @@ def hilo_captura(status_cb, rms_cb):
     """
     global silence_thresh_dynamic
     
-    engine = AudioCaptureEngine(status_cb, rms_cb)
+    engine = AudioCaptureEngine(status_cb, rms_cb, usar_mic)
     
     try:
         engine.start()
@@ -363,8 +393,50 @@ def hilo_captura(status_cb, rms_cb):
     rms_loop_acc = []
     rms_mic_acc  = []
     
+    reconnect_attempts = 0
+    max_reconnect_attempts = 5
+    
     try:
         while not stop_event.is_set():
+            # Verificar si los streams siguen activos o si se detuvieron por un cambio de hardware
+            loop_active = engine.stream_loop and engine.stream_loop.is_active()
+            mic_active = not engine.mic_ok or (engine.stream_mic and engine.stream_mic.is_active())
+            
+            if not loop_active or not mic_active:
+                if reconnect_attempts < max_reconnect_attempts:
+                    reconnect_attempts += 1
+                    status_cb(f"⏳ Audio desconectado. Intentando reconectar ({reconnect_attempts}/{max_reconnect_attempts})…")
+                    time.sleep(1.5)
+                    try:
+                        engine.stop()
+                        engine = AudioCaptureEngine(status_cb, rms_cb, usar_mic)
+                        engine.start()
+                        
+                        # Actualizar tasas e info con el nuevo hardware de audio
+                        work_rate = engine.rate_l
+                        sil_need      = int(SILENCE_SEC     * work_rate)
+                        min_sp        = int(MIN_SPEECH_SEC  * work_rate)
+                        max_ph        = int(MAX_PHRASE_SEC  * work_rate)
+                        pre_roll_max  = int(0.6 * work_rate)
+                        
+                        # Limpiar buffers de frase activa para evitar desalineación
+                        speech_buf_loop = np.zeros(0, dtype=np.float32)
+                        speech_buf_mic  = np.zeros(0, dtype=np.float32)
+                        rms_loop_acc.clear()
+                        rms_mic_acc.clear()
+                        in_speech = False
+                        
+                        status_cb("🔴 Escuchando…")
+                        continue
+                    except Exception as re_err:
+                        print(f"Error al reconectar dispositivos de audio: {re_err}")
+                        continue
+                else:
+                    raise RuntimeError("Los dispositivos de audio no responden tras varios intentos.")
+            else:
+                # Si reconectó con éxito, reiniciar contador de intentos
+                reconnect_attempts = 0
+
             # Leer chunks de ambas colas (no-bloqueante)
             loop_chunks, mic_chunks = engine.get_chunks()
             
@@ -995,7 +1067,7 @@ class TranscriptorApp:
         root.configure(bg=self.BG)
         self._icon_ref = aplicar_icono(root)
         self._build_ui()
-        threading.Thread(target=cargar_modelo, args=(self._status,), daemon=True).start()
+        self._cargar_modelo_async()
 
     def _build_ui(self):
         C, F, FB = self, ("Segoe UI",10), ("Segoe UI",11,"bold")
@@ -1033,18 +1105,50 @@ class TranscriptorApp:
         opt_row.pack(side="bottom", fill="x")
         self.var_screen = tk.BooleanVar(value=False)
         self.chk_screen = tk.Checkbutton(
-            opt_row, text="  🎥  Grabar pantalla (opcional)",
+            opt_row, text="  🎥  Grabar pantalla",
             variable=self.var_screen,
-            font=("Segoe UI",10,"bold"), fg=C.AMBER, bg="#0f1b30",
+            font=("Segoe UI",9,"bold"), fg=C.AMBER, bg="#0f1b30",
             activeforeground=C.AMBER, activebackground="#0f1b30",
             selectcolor="#1e293b", cursor="hand2",
             command=self._on_screen_toggle,
         )
-        self.chk_screen.pack(side="left", padx=16)
+        self.chk_screen.pack(side="left", padx=(14, 5))
+
+        self.var_mic = tk.BooleanVar(value=USAR_MIC)
+        self.chk_mic = tk.Checkbutton(
+            opt_row, text="  🎤  Mi voz (mic)",
+            variable=self.var_mic,
+            font=("Segoe UI",9,"bold"), fg=C.AMBER, bg="#0f1b30",
+            activeforeground=C.AMBER, activebackground="#0f1b30",
+            selectcolor="#1e293b", cursor="hand2",
+            command=self._on_mic_toggle,
+        )
+        self.chk_mic.pack(side="left", padx=5)
+        
         self.lbl_screen_status = tk.Label(
-            opt_row, text="Activa para grabar el area de pantalla y generar .mp4 al guardar",
-            font=("Segoe UI",9), fg=C.MUTED, bg="#0f1b30")
-        self.lbl_screen_status.pack(side="left", padx=4)
+            opt_row, text="",
+            font=("Segoe UI",8), fg=C.MUTED, bg="#0f1b30")
+        self.lbl_screen_status.pack(side="left", padx=2)
+
+        # Selector de modelo Whisper
+        tk.Label(opt_row, text="  |   ⚙️ Modelo:", font=("Segoe UI",9,"bold"), fg=C.FG, bg="#0f1b30").pack(side="left", padx=(8,2))
+        self.var_whisper_size = tk.StringVar(value=MODEL_SIZE)
+        self.cb_whisper_size = ttk.Combobox(
+            opt_row, textvariable=self.var_whisper_size,
+            values=["tiny", "base", "small", "medium"], state="readonly", width=7
+        )
+        self.cb_whisper_size.pack(side="left", padx=2)
+        self.cb_whisper_size.bind("<<ComboboxSelected>>", self._on_whisper_model_change)
+
+        # Selector de hilos de CPU
+        tk.Label(opt_row, text="  |   🧵 Hilos CPU:", font=("Segoe UI",9,"bold"), fg=C.FG, bg="#0f1b30").pack(side="left", padx=(8,2))
+        self.var_whisper_threads = tk.StringVar(value=str(WHISPER_THREADS))
+        self.cb_whisper_threads = ttk.Combobox(
+            opt_row, textvariable=self.var_whisper_threads,
+            values=["1", "2", "3", "4", "6", "8"], state="readonly", width=3
+        )
+        self.cb_whisper_threads.pack(side="left", padx=2)
+        self.cb_whisper_threads.bind("<<ComboboxSelected>>", self._on_whisper_threads_change)
 
         # Indicador de auto-guardado
         self.var_autosave = tk.StringVar(value="")
@@ -1075,9 +1179,14 @@ class TranscriptorApp:
                  ).pack(side="left", padx=4)
         tk.Label(vu_row, text="(sube si hay ruido, baja si no detecta voz)",
                  font=("Segoe UI",7), fg=C.MUTED, bg="#0f1b30").pack(side="left", padx=4)
-        tk.Label(vu_frame,
-                 text=f"Motor: faster-whisper {MODEL_SIZE}  |  [Tú]=azul  [Ellos]=verde  |  🐌 OpenTralla v2.0 Pro",
-                 font=("Segoe UI",8), fg=C.MUTED, bg="#0f1b30").pack(pady=(2,0))
+        device, _ = get_whisper_device()
+        device_info = "GPU CUDA" if device == "cuda" else f"CPU ({WHISPER_THREADS} hilos)"
+        self.lbl_motor_info = tk.Label(
+            vu_frame,
+            text=f"Motor: faster-whisper {MODEL_SIZE} ({device_info})  |  [Tú]=azul  [Ellos]=verde  |  🐌 OpenTralla v2.0 Pro",
+            font=("Segoe UI",8), fg=C.MUTED, bg="#0f1b30"
+        )
+        self.lbl_motor_info.pack(pady=(2,0))
 
         # Leyenda de colores
         leg = tk.Frame(self.root, bg=C.BG, pady=3)
@@ -1110,10 +1219,10 @@ class TranscriptorApp:
     # ──────────────────────────────────────────────────────────────────────────
     # Auto-guardado continuo (anti-pérdida — como hacen los profesionales)
     # ──────────────────────────────────────────────────────────────────────────
-    def _autosave(self):
+    def _autosave(self, force=False):
         """Guarda automáticamente la transcripción cada N segundos.
         Si la app se cierra inesperadamente, no se pierde nada."""
-        if not self.grabando:
+        if not self.grabando and not force:
             return
         if self.transcripcion:
             try:
@@ -1280,8 +1389,9 @@ class TranscriptorApp:
         # Iniciar auto-guardado
         self._autosave_id = self.root.after(AUTOSAVE_INTERVAL * 1000, self._autosave)
         self.var_autosave.set("🛡️ Auto-guardado activo")
+        usar_mic = self.var_mic.get()
         threading.Thread(target=hilo_captura,
-                         args=(self._status, self._update_vu), daemon=True).start()
+                         args=(self._status, self._update_vu, usar_mic), daemon=True).start()
         threading.Thread(target=hilo_transcripcion,
                          args=(self._agregar, self._status), daemon=True).start()
 
@@ -1301,12 +1411,70 @@ class TranscriptorApp:
             self.root.after_cancel(self._autosave_id)
             self._autosave_id = None
         # Auto-guardado final al detener
-        self._autosave()
+        self._autosave(force=True)
         self.var_autosave.set(f"🛡️ Último guardado: {datetime.datetime.now().strftime('%H:%M:%S')}")
         self.btn_ini.config(state="normal")
         self.btn_det.config(state="disabled")
         self.var_rec.set("")
         self._draw_vu(0.0)
+
+    def _cargar_modelo_async(self):
+        self.btn_ini.config(state="disabled")
+        
+        def on_status(msg):
+            self._status(msg)
+            # Volver a habilitar el botón cuando el modelo termine de cargar (ya sea con éxito o error)
+            if "✅" in msg or "❌" in msg:
+                device, _ = get_whisper_device()
+                device_info = "GPU CUDA" if device == "cuda" else f"CPU ({WHISPER_THREADS} hilos)"
+                motor_info = f"Motor: faster-whisper {MODEL_SIZE} ({device_info})  |  [Tú]=azul  [Ellos]=verde  |  🐌 OpenTralla v2.0 Pro"
+                self.root.after(0, lambda info=motor_info: self.lbl_motor_info.config(text=info))
+                self.root.after(0, lambda: self.btn_ini.config(state="normal"))
+                
+        threading.Thread(target=cargar_modelo, args=(on_status,), daemon=True).start()
+
+    def _on_whisper_model_change(self, _=None):
+        global MODEL_SIZE
+        if self.grabando:
+            messagebox.showwarning("Grabación activa", "No puedes cambiar el modelo durante la grabación.")
+            self.var_whisper_size.set(MODEL_SIZE)
+            return
+        
+        new_size = self.var_whisper_size.get()
+        if new_size == MODEL_SIZE:
+            return
+            
+        MODEL_SIZE = new_size
+        cfg = load_config()
+        cfg["whisper_model_size"] = MODEL_SIZE
+        save_config(cfg)
+        
+        self._cargar_modelo_async()
+
+    def _on_mic_toggle(self):
+        global USAR_MIC
+        USAR_MIC = self.var_mic.get()
+        cfg = load_config()
+        cfg["usar_mic"] = USAR_MIC
+        save_config(cfg)
+
+    def _on_whisper_threads_change(self, _=None):
+        global WHISPER_THREADS
+        if self.grabando:
+            messagebox.showwarning("Grabación activa", "No puedes cambiar los hilos durante la grabación.")
+            self.var_whisper_threads.set(str(WHISPER_THREADS))
+            return
+        
+        new_threads = int(self.var_whisper_threads.get())
+        if new_threads == WHISPER_THREADS:
+            return
+            
+        WHISPER_THREADS = new_threads
+        cfg = load_config()
+        cfg["whisper_cpu_threads"] = WHISPER_THREADS
+        save_config(cfg)
+        
+        self._cargar_modelo_async()
 
     def abrir_ia(self):
         transcript = "".join(self.transcripcion)
@@ -1332,6 +1500,16 @@ class TranscriptorApp:
         with open(path, "w", encoding="utf-8") as f:
             f.write(self._generar_transcripcion_formateada())
 
+        # 1b. Transcripción estructurada (.json)
+        json_path = base + ".json"
+        ok_json = False
+        try:
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(self._generar_json_estructurado(), f, indent=2, ensure_ascii=False)
+            ok_json = True
+        except Exception as e:
+            print(f"Error guardando JSON estructurado: {e}")
+
         # 2. Audio completo de la llamada (.wav) — mezcla de ambos canales
         wav_path = base + ".wav"
         ok_wav = self._guardar_wav_mixto(wav_path)
@@ -1344,6 +1522,8 @@ class TranscriptorApp:
                 ok_mp4 = self._muxear_video(self._screen_rec.video_path, wav_path, mp4_path)
 
         msg = f"📄 Transcripción:\n{path}"
+        if ok_json:
+            msg += f"\n\n📊 JSON estructurado:\n{json_path}"
         if ok_wav:
             msg += f"\n\n🔊 Audio de la llamada:\n{wav_path}"
         if ok_mp4:
