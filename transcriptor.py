@@ -1,20 +1,27 @@
 # -*- coding: utf-8 -*-
 """
-OpenTralla - Transcriptor Profesional de Llamadas v2.0
+OpenTralla - Grabadora + Transcriptor de Llamadas v2.2
 ══════════════════════════════════════════════════════
-Grabación de calidad profesional inspirada en sistemas como Twilio y Zoom:
+Flujo por defecto: GRABAR primero, TRANSCRIBIR después.
+Durante la llamada solo se graba audio — nada de Whisper, nada de VAD — para
+que la CPU quede libre y la videollamada no se degrade (voz robotizada/cortes).
+Al colgar, el botón «Transcribir» procesa la grabación entera de una vez.
+
+- Grabación a DISCO según entra: la RAM no crece con la duración de la llamada
+- PCM crudo sin cabecera: a prueba de cierres inesperados, nada que reparar
+- Streams sincronizados: se rellenan con silencio los huecos del loopback
+  (WASAPI no entrega paquetes mientras el sistema no reproduce nada)
+- Recuperación al abrir: si quedó una grabación sin transcribir, te la ofrece
 - Captura a tasa NATIVA del dispositivo (44100/48000Hz) — sin resampleo destructivo
 - Modo CALLBACK (no-bloqueante) — elimina chasquidos/crujidos por buffer underrun
-- Streams 100% SEPARADOS: mic (Tú) y loopback (Ellos) — como grabación dual-channel
-- Noise gate inteligente — reemplaza cancelación de eco destructiva
+- Streams 100% SEPARADOS: mic (Tú) y loopback (Ellos)
 - Fade-in anti-pop al iniciar — elimina el clic inicial
-- Auto-guardado continuo — nunca se pierde nada
-- Guardado dual-channel estéreo (Tú=izquierdo, Ellos=derecho)
+- Carga perezosa del modelo: la app abre al instante
 - Transcripción estructurada + JSON
 
-Diarización: mic=[Tú] / loopback=[Ellos] por VAD independiente por stream
-Pre-roll de 0.6s para no perder primeras palabras
-VAD con umbral ajustable por slider
+Diarización: mic=[Tú] / loopback=[Ellos] comparando actividad por stream
+Transcripción en vivo opcional (interruptor «⚡ Transcribir en vivo», apagado
+por defecto) con VAD de umbral ajustable y pre-roll de 0.6s
 Resumen/análisis con Gemini, Claude, OpenAI o Ollama (local)
 """
 
@@ -61,6 +68,10 @@ if MISSING:
 # ─── Config y parámetros ────────────────────────────────────────────────────────
 CONFIG_FILE    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 AUTOSAVE_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_autosave")
+# Aquí van las grabaciones. El audio se escribe a disco mientras grabas, así que
+# la RAM se mantiene plana aunque la llamada dure horas y nada se pierde si la
+# app se cierra de golpe.
+GRAB_DIR       = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grabaciones")
 
 def load_config() -> dict:
     if os.path.exists(CONFIG_FILE):
@@ -82,6 +93,9 @@ _cfg = load_config()
 MODEL_SIZE     = _cfg.get("whisper_model_size", "small")
 WHISPER_THREADS = _cfg.get("whisper_cpu_threads", 2)
 USAR_MIC        = _cfg.get("usar_mic", True)
+# Transcripción en vivo: DESACTIVADA por defecto.
+# Modo grabadora = la CPU queda libre durante la llamada (sin voz robotizada).
+LIVE_TRANSCRIBE = _cfg.get("transcripcion_vivo", False)
 
 WHISPER_RATE   = 16000                  # Tasa que Whisper necesita (solo para transcripción)
 CHUNK_FRAMES   = 2048                   # Buffer grande = sin chasquidos (era 512 → underruns)
@@ -93,6 +107,9 @@ MAX_PHRASE_SEC = 25                     # Máximo antes de forzar corte
 SILENCE_THRESH = 0.003                  # Umbral VAD por defecto
 FADE_IN_MS     = 15                     # Duración del fade-in anti-pop (ms)
 AUTOSAVE_INTERVAL = 30                  # Segundos entre auto-guardados
+SYNC_INTERVAL  = 10                     # Segundos entre volcados forzados a disco
+HUECO_MIN_SEG  = 0.5                    # Hueco mínimo que se rellena con silencio
+VACIO_F32      = np.zeros(0, dtype=np.float32)
 
 # ─── Estado global ─────────────────────────────────────────────────────────────
 phrase_queue: queue.Queue = queue.Queue()   # items: (audio_f32_16k, speaker_label)
@@ -100,10 +117,11 @@ stop_event    = threading.Event()
 model_ready   = threading.Event()
 whisper_model = None
 silence_thresh_dynamic = SILENCE_THRESH
+_loaded_model_key = None                      # (tamaño, hilos) del modelo en RAM
+offline_cancel = threading.Event()            # cancelar la transcripción diferida
 
-# Buffers de audio separados (calidad profesional: streams independientes)
-audio_buf_mic:  list = []     # Solo tu voz (micrófono)
-audio_buf_loop: list = []     # Solo ellos (loopback/sistema)
+# El audio ya NO se acumula en memoria: se escribe a disco en la sesión activa
+# (ver SesionGrabacion). Estas tasas las fija el motor al detectar el hardware.
 native_rate_loop: int = 48000 # Se actualiza al detectar dispositivo
 native_rate_mic:  int = 48000
 
@@ -120,8 +138,10 @@ def get_whisper_device() -> tuple:
     return "cpu", "int8"
 
 def cargar_modelo(status_cb):
-    global whisper_model
+    global whisper_model, _loaded_model_key
     model_ready.clear()
+    _loaded_model_key = None
+    whisper_model = None          # libera el modelo anterior antes de cargar otro
     status_cb(f"⏳ Cargando modelo '{MODEL_SIZE}'…")
     try:
         # Detectar si hay CUDA disponible en ctranslate2
@@ -134,10 +154,32 @@ def cargar_modelo(status_cb):
             status_cb(f"⏳ Cargando modelo '{MODEL_SIZE}' en CPU ({WHISPER_THREADS} hilos)…")
             whisper_model = WhisperModel(MODEL_SIZE, device="cpu", compute_type=compute_type, cpu_threads=WHISPER_THREADS)
             
+        _loaded_model_key = (MODEL_SIZE, WHISPER_THREADS)
         model_ready.set()
         status_cb(f"✅ Modelo '{MODEL_SIZE}' listo ({device.upper()})")
     except Exception as e:
         status_cb(f"❌ Error cargando modelo: {e}")
+
+
+def modelo_vigente() -> bool:
+    """¿Hay un modelo cargado y coincide con la configuración actual?"""
+    return model_ready.is_set() and _loaded_model_key == (MODEL_SIZE, WHISPER_THREADS)
+
+def asegurar_modelo(status_cb) -> bool:
+    """Carga perezosa: solo carga Whisper si realmente hace falta.
+    En modo grabadora el modelo NO se toca hasta que pulsas «Transcribir»."""
+    if modelo_vigente():
+        return True
+    cargar_modelo(status_cb)
+    return model_ready.is_set()
+
+def liberar_modelo():
+    """Saca el modelo de la RAM. Se usa al pasar a modo grabadora para dejar
+    la memoria y la CPU libres durante la videollamada."""
+    global whisper_model, _loaded_model_key
+    model_ready.clear()
+    whisper_model = None
+    _loaded_model_key = None
 
 
 # ─── Utilidades audio profesionales ──────────────────────────────────────────
@@ -158,6 +200,36 @@ def resample_for_whisper(audio: np.ndarray, source_rate: int) -> np.ndarray:
     ix = np.linspace(0, len(audio) - 1, nl)
     return np.interp(ix, np.arange(len(audio)), audio).astype(np.float32)
 
+def resample_largo(audio: np.ndarray, source_rate: int, target_rate: int = WHISPER_RATE,
+                   bloque_seg: int = 60) -> np.ndarray:
+    """Resamplea grabaciones LARGAS (una llamada entera) sin reventar la RAM.
+
+    - Si la tasa es múltiplo exacta (48000→16000) promedia cada N muestras:
+      es un downsample con antialiasing, mejor que interpolar.
+    - Si no (44100→16000) interpola por bloques de 60 s en vez de generar
+      un índice gigante de toda la grabación de una sola vez.
+    """
+    if len(audio) == 0:
+        return np.zeros(0, dtype=np.float32)
+    if source_rate == target_rate:
+        return audio.astype(np.float32, copy=False)
+    if source_rate % target_rate == 0:
+        f = source_rate // target_rate
+        n = (len(audio) // f) * f
+        if n == 0:
+            return np.zeros(0, dtype=np.float32)
+        return audio[:n].reshape(-1, f).mean(axis=1).astype(np.float32)
+    partes = []
+    paso = source_rate * bloque_seg
+    for i in range(0, len(audio), paso):
+        seg = audio[i:i + paso]
+        nl = int(round(len(seg) * target_rate / source_rate))
+        if nl <= 0:
+            continue
+        ix = np.linspace(0, len(seg) - 1, nl)
+        partes.append(np.interp(ix, np.arange(len(seg)), seg).astype(np.float32))
+    return np.concatenate(partes) if partes else np.zeros(0, dtype=np.float32)
+
 def rms(s: np.ndarray) -> float:
     return float(np.sqrt(np.mean(s**2))) if len(s) > 0 else 0.0
 
@@ -171,6 +243,302 @@ def apply_fade_in(audio: np.ndarray, rate: int, duration_ms: int = FADE_IN_MS) -
         audio = audio.copy()
         audio[:n_samples] *= fade
     return audio
+
+
+# ─── Grabación en disco (streams separados, RAM plana) ───────────────────────
+# El audio se vuelca a disco según entra, en PCM crudo int16 mono por stream.
+# Sin cabeceras a propósito: si la app se cierra de golpe el archivo sigue siendo
+# válido hasta el último byte escrito, no hay nada que reparar. El WAV final se
+# genera al guardar, leyendo por bloques.
+
+def f32_a_pcm16(a: np.ndarray) -> np.ndarray:
+    """float32 [-1,1] → PCM int16."""
+    return np.clip(a * 32767.0, -32768, 32767).astype(np.int16)
+
+
+def _leer_bloques_pcm(path: str, muestras: int):
+    """Generador de bloques float32 leídos de un .pcm int16 mono."""
+    if not os.path.exists(path):
+        return
+    with open(path, "rb") as f:
+        while True:
+            raw = f.read(muestras * 2)
+            if not raw:
+                return
+            if len(raw) % 2:          # corte a mitad de muestra (cierre brusco)
+                raw = raw[:-1]
+            if not raw:
+                return
+            yield np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def leer_pcm_a_16k(path: str, source_rate: int, bloque_seg: int = 60) -> np.ndarray:
+    """Lee un .pcm entero y lo devuelve YA remuestreado a 16 kHz.
+
+    Nunca carga la grabación completa a tasa nativa: para una llamada de 1 h el
+    pico de RAM baja de ~690 MB por stream a ~115 MB.
+    """
+    partes = [resample_largo(b, source_rate)
+              for b in _leer_bloques_pcm(path, source_rate * bloque_seg)]
+    partes = [p for p in partes if len(p) > 0]
+    return np.concatenate(partes) if partes else np.zeros(0, dtype=np.float32)
+
+
+class SesionGrabacion:
+    """Una llamada grabada, guardada en su propia carpeta dentro de grabaciones/.
+
+    Contenido de la carpeta:
+      ellos.pcm   audio de la videollamada (loopback del sistema)
+      tu.pcm      tu micrófono
+      sesion.json tasas de muestreo, hora de inicio y si hubo micrófono
+      .listo      marca de "ya transcrita/guardada" (para no volver a ofrecerla)
+    """
+
+    def __init__(self, carpeta: str):
+        self.carpeta   = carpeta
+        self.path_loop = os.path.join(carpeta, "ellos.pcm")
+        self.path_mic  = os.path.join(carpeta, "tu.pcm")
+        self.path_meta = os.path.join(carpeta, "sesion.json")
+        self.rate_loop = 48000
+        self.rate_mic  = 48000
+        self.mic_ok    = False
+        self.inicio    = None
+        self._f_loop   = None
+        self._f_mic    = None
+        self._lock     = threading.Lock()
+        self._t0       = None   # reloj de referencia para mantener la sincronía
+        self._n_loop   = 0      # muestras escritas en ellos.pcm
+        self._n_mic    = 0      # muestras escritas en tu.pcm
+
+    # ── creación / apertura ──
+    @staticmethod
+    def nueva() -> "SesionGrabacion":
+        ahora = datetime.datetime.now()
+        base = os.path.join(GRAB_DIR, "sesion_" + ahora.strftime("%Y%m%d_%H%M%S"))
+        # Si paras y vuelves a grabar dentro del mismo segundo, el nombre
+        # coincidiría y la grabación nueva pisaría la anterior. Nunca.
+        carpeta, n = base, 2
+        while os.path.exists(carpeta):
+            carpeta = f"{base}_{n}"
+            n += 1
+        os.makedirs(carpeta, exist_ok=True)
+        s = SesionGrabacion(carpeta)
+        s.inicio = ahora
+        return s
+
+    @staticmethod
+    def abrir(carpeta: str) -> "SesionGrabacion":
+        """Carga una sesión que ya está en disco (recuperación tras un cierre)."""
+        s = SesionGrabacion(carpeta)
+        try:
+            with open(s.path_meta, encoding="utf-8") as f:
+                meta = json.load(f)
+            s.rate_loop = int(meta.get("rate_loop", 48000))
+            s.rate_mic  = int(meta.get("rate_mic", 48000))
+            s.mic_ok    = bool(meta.get("mic_ok", False))
+            if meta.get("inicio"):
+                s.inicio = datetime.datetime.fromisoformat(meta["inicio"])
+        except Exception:
+            pass
+        return s
+
+    # ── escritura (desde el hilo de captura) ──
+    def empezar(self, rate_loop: int, rate_mic: int, mic_ok: bool):
+        self.rate_loop, self.rate_mic, self.mic_ok = rate_loop, rate_mic, mic_ok
+        os.makedirs(self.carpeta, exist_ok=True)
+        with self._lock:
+            self._f_loop = open(self.path_loop, "wb")
+            self._f_mic  = open(self.path_mic, "wb") if mic_ok else None
+            self._t0     = time.monotonic()
+            self._n_loop = self._n_mic = 0
+        self._guardar_meta()
+
+    def _guardar_meta(self):
+        try:
+            with open(self.path_meta, "w", encoding="utf-8") as f:
+                json.dump({
+                    "app": "OpenTralla",
+                    "inicio": self.inicio.isoformat() if self.inicio else None,
+                    "rate_loop": self.rate_loop,
+                    "rate_mic": self.rate_mic,
+                    "mic_ok": self.mic_ok,
+                    "formato": "PCM crudo int16 mono, sin cabecera",
+                }, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"No se pudo escribir sesion.json: {e}")
+
+    @staticmethod
+    def _rellenar(f, escritas: int, rate: int, transcurrido: float, n_chunk: int) -> int:
+        """Tapa con silencio el hueco que deja un stream mudo, y devuelve cuántas
+        muestras de relleno escribió.
+
+        Hace falta porque WASAPI NO entrega paquetes de loopback mientras el
+        sistema no está reproduciendo nada. Sin este relleno, el audio de la
+        videollamada se pegaría al principio del archivo y quedaría desplazado
+        respecto a tu micrófono: las voces sonarían descolocadas en el WAV y la
+        diarización atribuiría las frases al hablante equivocado.
+        """
+        faltan = int(transcurrido * rate) - escritas - n_chunk
+        if faltan < int(rate * HUECO_MIN_SEG):
+            return 0
+        cero = np.zeros(min(faltan, rate), dtype=np.int16).tobytes()
+        restantes = faltan
+        while restantes > 0:
+            n = min(restantes, rate)
+            f.write(cero[:n * 2])
+            restantes -= n
+        return faltan
+
+    def escribir(self, loop_c: np.ndarray, mic_c: np.ndarray):
+        """Vuelca al disco los chunks del período, manteniendo ambos streams
+        alineados en el tiempo."""
+        with self._lock:
+            if self._t0 is None:
+                return
+            transcurrido = time.monotonic() - self._t0
+            if self._f_loop is not None:
+                self._n_loop += self._rellenar(self._f_loop, self._n_loop,
+                                               self.rate_loop, transcurrido, len(loop_c))
+                if len(loop_c) > 0:
+                    self._f_loop.write(f32_a_pcm16(loop_c).tobytes())
+                    self._n_loop += len(loop_c)
+            if self._f_mic is not None:
+                self._n_mic += self._rellenar(self._f_mic, self._n_mic,
+                                              self.rate_mic, transcurrido, len(mic_c))
+                if len(mic_c) > 0:
+                    self._f_mic.write(f32_a_pcm16(mic_c).tobytes())
+                    self._n_mic += len(mic_c)
+
+    def sincronizar(self):
+        """Fuerza el volcado al disco — lo que ya está escrito sobrevive a un
+        cierre brusco, un cuelgue o un corte de luz."""
+        with self._lock:
+            for f in (self._f_loop, self._f_mic):
+                if f is None:
+                    continue
+                try:
+                    f.flush()
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+
+    def cerrar(self):
+        self.sincronizar()
+        with self._lock:
+            for f in (self._f_loop, self._f_mic):
+                if f is not None:
+                    try: f.close()
+                    except Exception: pass
+            self._f_loop = self._f_mic = None
+            self._t0 = None
+        self._guardar_meta()
+
+    # ── lectura / estado ──
+    @staticmethod
+    def _muestras(path: str) -> int:
+        try:
+            return os.path.getsize(path) // 2
+        except OSError:
+            return 0
+
+    def n_loop(self) -> int: return self._muestras(self.path_loop)
+    def n_mic(self)  -> int: return self._muestras(self.path_mic)
+
+    def tiene_audio(self) -> bool:
+        return self.n_loop() > 0 or self.n_mic() > 0
+
+    def duracion_seg(self) -> float:
+        d_loop = self.n_loop() / self.rate_loop if self.rate_loop else 0.0
+        d_mic  = self.n_mic()  / self.rate_mic  if self.rate_mic  else 0.0
+        return max(d_loop, d_mic)
+
+    def tamano_mb(self) -> float:
+        total = 0
+        for p in (self.path_loop, self.path_mic):
+            try: total += os.path.getsize(p)
+            except OSError: pass
+        return total / (1024 * 1024)
+
+    def marcar_listo(self):
+        """Marca la sesión como ya atendida para no volver a ofrecerla al abrir."""
+        try:
+            with open(os.path.join(self.carpeta, ".listo"), "w", encoding="utf-8") as f:
+                f.write(datetime.datetime.now().isoformat())
+        except Exception:
+            pass
+
+    def borrar(self) -> bool:
+        """Borra la carpeta de la sesión (solo se llama si el usuario lo pide)."""
+        try:
+            shutil.rmtree(self.carpeta)
+            return True
+        except Exception as e:
+            print(f"No se pudo borrar {self.carpeta}: {e}")
+            return False
+
+
+def sesiones_pendientes() -> list:
+    """Grabaciones en disco con audio y sin marcar como atendidas, de la más
+    reciente a la más vieja. Es la red de seguridad si la app se cerró sola."""
+    if not os.path.isdir(GRAB_DIR):
+        return []
+    out = []
+    try:
+        nombres = sorted(os.listdir(GRAB_DIR), reverse=True)
+    except OSError:
+        return []
+    for nombre in nombres:
+        carpeta = os.path.join(GRAB_DIR, nombre)
+        if not nombre.startswith("sesion_") or not os.path.isdir(carpeta):
+            continue
+        if os.path.exists(os.path.join(carpeta, ".listo")):
+            continue
+        s = SesionGrabacion.abrir(carpeta)
+        if s.tiene_audio():
+            out.append(s)
+    return out
+
+
+def escribir_wav_mezcla(sesion: SesionGrabacion, destino: str,
+                        ganancia: float = 0.7, bloque_seg: int = 30) -> bool:
+    """Genera el WAV final de la llamada mezclando ambos streams.
+
+    Se lee y se escribe por bloques, así que la RAM no crece con la duración:
+    una llamada de 3 horas se guarda con el mismo consumo que una de 3 minutos.
+    """
+    n_loop, n_mic = sesion.n_loop(), sesion.n_mic()
+    if n_loop == 0 and n_mic == 0:
+        return False
+    # El loopback manda: es la referencia temporal del resto de la app
+    rate = sesion.rate_loop if n_loop else sesion.rate_mic
+    g_loop = _leer_bloques_pcm(sesion.path_loop, rate * bloque_seg) if n_loop else iter(())
+    g_mic  = _leer_bloques_pcm(sesion.path_mic, int(sesion.rate_mic * bloque_seg)) if n_mic else iter(())
+    try:
+        with wave.open(destino, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(rate)
+            while True:
+                b_loop = next(g_loop, None)
+                b_mic  = next(g_mic,  None)
+                if b_loop is None and b_mic is None:
+                    break
+                if b_mic is not None and len(b_mic) > 0 and sesion.rate_mic != rate:
+                    b_mic = resample_largo(b_mic, sesion.rate_mic, rate)
+                n = max(len(b_loop) if b_loop is not None else 0,
+                        len(b_mic)  if b_mic  is not None else 0)
+                if n == 0:
+                    continue
+                mez = np.zeros(n, dtype=np.float32)
+                if b_loop is not None:
+                    mez[:len(b_loop)] += b_loop * ganancia
+                if b_mic is not None:
+                    mez[:len(b_mic)] += b_mic * ganancia
+                wf.writeframes(f32_a_pcm16(np.clip(mez, -1, 1)).tobytes())
+        return True
+    except Exception as e:
+        print(f"Error escribiendo {destino}: {e}")
+        return False
 
 
 # ─── Captura Profesional con Callbacks (modo no-bloqueante) ──────────────────
@@ -354,8 +722,17 @@ class AudioCaptureEngine:
                 pass
 
 
-def hilo_captura(status_cb, rms_cb, usar_mic=True):
-    """Hilo principal de captura, VAD y diarización.
+def hilo_captura(status_cb, rms_cb, usar_mic=True, live=False, sesion=None):
+    """Hilo principal de captura. Con live=True además hace VAD y diarización.
+
+    El audio siempre se escribe a `sesion` (disco) según entra, nunca se acumula
+    en RAM: una llamada de 3 horas consume lo mismo que una de 3 minutos.
+
+    MODO GRABADORA (live=False, por defecto): solo se vuelca el audio a disco.
+    Cero Whisper, cero VAD — la CPU queda libre para Zoom/Teams durante la
+    llamada, sin voz robotizada.
+
+    MODO EN VIVO (live=True):
     
     Arquitectura profesional (tipo call center):
     1. El motor de audio captura con callbacks (sin bloqueo)
@@ -369,6 +746,8 @@ def hilo_captura(status_cb, rms_cb, usar_mic=True):
     
     try:
         engine.start()
+        if sesion is not None:
+            sesion.empezar(engine.rate_l, engine.rate_m, engine.mic_ok)
     except Exception as e:
         status_cb(f"❌ Captura: {e}")
         return
@@ -395,6 +774,8 @@ def hilo_captura(status_cb, rms_cb, usar_mic=True):
     
     reconnect_attempts = 0
     max_reconnect_attempts = 5
+    last_vu     = 0.0   # limita los refrescos del VU meter (no saturar el hilo Tk)
+    ultimo_sync = 0.0   # último volcado forzado a disco
     
     try:
         while not stop_event.is_set():
@@ -458,16 +839,31 @@ def hilo_captura(status_cb, rms_cb, usar_mic=True):
             # Ahora simplemente grabamos AMBOS streams siempre y decidimos
             # quién habla al final de la frase comparando patrones de actividad.
             
-            # Guardar audio separado en buffers globales (calidad nativa original)
-            if len(loop_c) > 0:
-                audio_buf_loop.append(loop_c.copy())
-            if engine.mic_ok and len(mic_c) > 0:
-                audio_buf_mic.append(mic_c.copy())
+            # ── Volcado a disco ──
+            # El audio va directo al archivo de la sesión, a calidad nativa.
+            # No se acumula nada en RAM, y lo ya escrito sobrevive a un cierre
+            # brusco, un cuelgue o un corte de luz.
+            ahora = time.time()
+            if sesion is not None:
+                sesion.escribir(loop_c, mic_c if engine.mic_ok else VACIO_F32)
+                if ahora - ultimo_sync >= SYNC_INTERVAL:
+                    sesion.sincronizar()
+                    ultimo_sync = ahora
             
-            # ── VAD combinado ──
-            # Usamos el nivel más alto de AMBOS streams como referencia
+            # VU meter — máximo ~12 refrescos/s para no saturar el hilo de Tk
             level = max(rms_loop_now, rms_mic_now)
-            rms_cb(level)
+            if ahora - last_vu >= 0.08:
+                rms_cb(level)
+                last_vu = ahora
+
+            # ── MODO GRABADORA ──
+            # Sin transcripción en vivo el hilo termina aquí: no hay VAD,
+            # ni diarización, ni Whisper. Solo se copia audio a memoria.
+            if not live:
+                continue
+
+            # ── VAD combinado (solo con transcripción en vivo) ──
+            # Usamos el nivel más alto de AMBOS streams como referencia
             thresh = silence_thresh_dynamic
             
             # Alinear longitudes para sincronización
@@ -534,6 +930,8 @@ def hilo_captura(status_cb, rms_cb, usar_mic=True):
         status_cb(f"❌ Captura: {e}")
     finally:
         engine.stop()
+        if sesion is not None:
+            sesion.cerrar()
 
 
 def _prepare_audio_for_whisper(buf_loop, buf_mic, source_rate):
@@ -640,6 +1038,108 @@ def hilo_transcripcion(text_cb, status_cb):
         try: phrase_queue.get_nowait()
         except: break
     status_cb("⏸️ Detenido")
+
+
+# ─── Transcripción DIFERIDA (al final de la llamada) ─────────────────────────
+# Este es el camino por defecto: se graba la llamada limpia y Whisper corre
+# después, con la CPU libre. Además sale MEJOR que en vivo, porque Whisper
+# recibe la grabación entera y tiene el contexto completo de la conversación.
+
+def _rms_ventanas(sig: np.ndarray, t0: float, t1: float,
+                  rate: int = WHISPER_RATE, win: float = 0.1) -> list:
+    """RMS por ventanas de 100 ms dentro de un rango temporal del audio."""
+    i0 = max(0, int(t0 * rate))
+    i1 = min(len(sig), int(t1 * rate))
+    if i1 <= i0:
+        return []
+    paso = max(1, int(win * rate))
+    return [rms(sig[i:i + paso]) for i in range(i0, i1, paso)]
+
+
+def _hablante_de_rango(loop16: np.ndarray, mic16: np.ndarray,
+                       t0: float, t1: float, mic_ok: bool) -> str:
+    """Decide quién habla en un segmento ya transcrito, comparando la actividad
+    de cada stream en esa franja de tiempo. Reutiliza la misma lógica de ratios
+    adaptativos que la diarización en vivo."""
+    if not mic_ok:
+        return ""
+    return _decide_speaker(_rms_ventanas(loop16, t0, t1),
+                           _rms_ventanas(mic16,  t0, t1), True)
+
+
+def transcribir_grabacion(sesion, text_cb, status_cb, done_cb, inicio=None):
+    """Transcribe la grabación COMPLETA que hay en disco.
+
+    sesion                       — SesionGrabacion a transcribir
+    text_cb(ts, hablante, texto) — se llama por cada frase reconocida
+    done_cb(estado, mensaje)     — "ok" | "vacio" | "cancelado" | "error"
+    inicio                       — datetime del arranque de la grabación
+    """
+    offline_cancel.clear()
+    try:
+        if sesion is None or not sesion.tiene_audio():
+            done_cb("vacio", "No hay ninguna grabación en disco.")
+            return
+        if not asegurar_modelo(status_cb):
+            done_cb("error", "No se pudo cargar el modelo Whisper.")
+            return
+        if offline_cancel.is_set():
+            done_cb("cancelado", "Cancelado antes de empezar.")
+            return
+
+        status_cb("⚙️ Leyendo la grabación del disco…")
+        # Se lee por bloques y ya remuestreado a 16 kHz: la llamada entera a tasa
+        # nativa nunca llega a estar en memoria.
+        loop16 = leer_pcm_a_16k(sesion.path_loop, sesion.rate_loop)
+        mic16  = leer_pcm_a_16k(sesion.path_mic,  sesion.rate_mic)
+        mic_ok = len(mic16) > 0
+
+        n = max(len(loop16), len(mic16))
+        if n == 0:
+            done_cb("vacio", "La grabación está vacía.")
+            return
+        # Igualar longitudes para poder comparar ambos streams muestra a muestra
+        if len(loop16) < n:
+            loop16 = np.concatenate([loop16, np.zeros(n - len(loop16), dtype=np.float32)])
+        if len(mic16) < n:
+            mic16 = np.concatenate([mic16, np.zeros(n - len(mic16), dtype=np.float32)])
+
+        # Whisper recibe AMBOS streams mezclados para no perder nada
+        mezcla = np.clip(loop16 * 0.6 + mic16 * 0.6, -1, 1).astype(np.float32)
+        total_seg = n / WHISPER_RATE
+        status_cb(f"⚙️ Transcribiendo {total_seg/60:.1f} min de grabación…")
+
+        segs, _info = whisper_model.transcribe(
+            mezcla, language=LANGUAGE,
+            beam_size=5, temperature=0.0,
+            # VAD de Silero: se salta los silencios → mucho más rápido
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=500),
+            # Evita que Whisper se enganche repitiendo frases en audios largos
+            condition_on_previous_text=False,
+        )
+
+        n_frases = 0
+        for seg in segs:
+            if offline_cancel.is_set():
+                done_cb("cancelado", f"Cancelado. Se conservaron {n_frases} frases.")
+                return
+            texto = seg.text.strip()
+            if not texto:
+                continue
+            hablante = _hablante_de_rango(loop16, mic16, seg.start, seg.end, mic_ok)
+            if inicio:
+                ts = (inicio + datetime.timedelta(seconds=seg.start)).strftime("%H:%M:%S")
+            else:
+                ts = time.strftime("%H:%M:%S", time.gmtime(seg.start))
+            text_cb(ts, hablante, texto)
+            n_frases += 1
+            pct = min(100, int(seg.end / total_seg * 100)) if total_seg > 0 else 0
+            status_cb(f"⚙️ Transcribiendo… {pct}%   ({n_frases} frases)")
+
+        done_cb("ok", f"Transcripción terminada: {n_frases} frases.")
+    except Exception as e:
+        done_cb("error", str(e))
 
 
 # ─── Grabación de pantalla (opcional) ─────────────────────────────────────────
@@ -1046,7 +1546,7 @@ def aplicar_icono(root: tk.Tk):
 class TranscriptorApp:
     BG = "#1a1a2e"; PANEL = "#16213e"; ACCENT = "#0f3460"
     GREEN = "#4ade80"; RED = "#f87171"; FG = "#e2e8f0"
-    MUTED = "#94a3b8"; AMBER = "#fbbf24"
+    MUTED = "#94a3b8"; AMBER = "#fbbf24"; BLUE = "#38bdf8"
     # Colores de etiquetas de hablante
     COLOR_TU    = "#60a5fa"   # azul — tú
     COLOR_ELLOS = "#4ade80"   # verde — ellos
@@ -1061,13 +1561,26 @@ class TranscriptorApp:
         self._screen_rec   = None
         self._autosave_id  = None
         self._start_time   = None
-        root.title("🐌 OpenTralla — Transcriptor Profesional v2.0")
+        self._end_time     = None
+        self._transcribiendo  = False   # transcripción diferida en curso
+        self._cargando_modelo = False
+        self.sesion           = None    # SesionGrabacion en curso o cargada
+        self._hilo_captura    = None
+        root.title("🐌 OpenTralla — Grabadora + Transcriptor v2.2")
         root.geometry("960x700")
         root.minsize(700, 540)
         root.configure(bg=self.BG)
         self._icon_ref = aplicar_icono(root)
         self._build_ui()
-        self._cargar_modelo_async()
+        # Carga perezosa: en modo grabadora Whisper NO se carga hasta que pulsas
+        # «Transcribir». La app abre al instante y la RAM queda libre.
+        if LIVE_TRANSCRIBE:
+            self._cargar_modelo_async()
+        else:
+            self._status("✅ Listo para grabar — Whisper se carga al transcribir")
+        self._estado_botones()
+        # Red de seguridad: ¿quedó una grabación sin transcribir de la vez pasada?
+        self.root.after(400, self._revisar_pendientes)
 
     def _build_ui(self):
         C, F, FB = self, ("Segoe UI",10), ("Segoe UI",11,"bold")
@@ -1075,9 +1588,9 @@ class TranscriptorApp:
         # Encabezado
         hdr = tk.Frame(self.root, bg=C.ACCENT, pady=11)
         hdr.pack(side="top", fill="x")
-        tk.Label(hdr, text="🐌  OpenTralla v2.0",
+        tk.Label(hdr, text="🐌  OpenTralla v2.2",
                  font=("Segoe UI",15,"bold"), fg=C.FG, bg=C.ACCENT).pack(side="left", padx=16)
-        tk.Label(hdr, text="Grabación Profesional  |  Dual-Channel  |  100% local  |  Anti-pérdida",
+        tk.Label(hdr, text="Graba primero, transcribe después  |  Dual-Channel  |  100% local",
                  font=F, fg=C.MUTED, bg=C.ACCENT).pack(side="left")
 
         # ── Botones (side=bottom primero) ─────────────────────────────────────
@@ -1090,12 +1603,17 @@ class TranscriptorApp:
         self.btn_det = tk.Button(bf, text="⏹  Detener", bg=C.RED, fg="#0d1117",
                                  command=self.detener, state="disabled", **kw)
         self.btn_det.pack(side="left", padx=4)
+        self.btn_trans = tk.Button(bf, text="📝  Transcribir", bg=C.BLUE, fg="#0d1117",
+                                   command=self.transcribir_offline, state="disabled", **kw)
+        self.btn_trans.pack(side="left", padx=4)
         tk.Button(bf, text="🤖  Analizar con IA", bg="#7c3aed", fg=C.FG,
                   command=self.abrir_ia, **kw).pack(side="left", padx=4)
         tk.Button(bf, text="💾  Guardar", bg=C.ACCENT, fg=C.FG,
                   command=self.guardar, **kw).pack(side="left", padx=4)
         tk.Button(bf, text="🗑️  Limpiar", bg="#334155", fg=C.FG,
                   command=self.limpiar, **kw).pack(side="left", padx=4)
+        tk.Button(bf, text="📂  Grabaciones", bg="#334155", fg=C.FG,
+                  command=self.abrir_carpeta, **kw).pack(side="left", padx=4)
         self.var_rec = tk.StringVar(value="")
         tk.Label(bf, textvariable=self.var_rec,
                  font=("Segoe UI",13,"bold"), fg=C.RED, bg=C.PANEL).pack(side="right", padx=14)
@@ -1103,6 +1621,26 @@ class TranscriptorApp:
         # Fila de opciones (siempre visible)
         opt_row = tk.Frame(self.root, bg="#0f1b30", pady=5)
         opt_row.pack(side="bottom", fill="x")
+
+        # ── Interruptor de transcripción en vivo (APAGADO por defecto) ──
+        self.var_live = tk.BooleanVar(value=LIVE_TRANSCRIBE)
+        self.chk_live = tk.Checkbutton(
+            opt_row, text="  ⚡  Transcribir en vivo",
+            variable=self.var_live,
+            font=("Segoe UI",9,"bold"), fg=C.BLUE, bg="#0f1b30",
+            activeforeground=C.BLUE, activebackground="#0f1b30",
+            selectcolor="#1e293b", cursor="hand2",
+            command=self._on_live_toggle,
+        )
+        self.chk_live.pack(side="left", padx=(14, 2))
+        self.lbl_live_info = tk.Label(
+            opt_row,
+            text=("⚠️ usa CPU durante la llamada" if LIVE_TRANSCRIBE
+                  else "CPU libre — transcribes al final"),
+            font=("Segoe UI",8),
+            fg=(C.RED if LIVE_TRANSCRIBE else "#22c55e"), bg="#0f1b30")
+        self.lbl_live_info.pack(side="left", padx=(0, 4))
+
         self.var_screen = tk.BooleanVar(value=False)
         self.chk_screen = tk.Checkbutton(
             opt_row, text="  🎥  Grabar pantalla",
@@ -1112,7 +1650,7 @@ class TranscriptorApp:
             selectcolor="#1e293b", cursor="hand2",
             command=self._on_screen_toggle,
         )
-        self.chk_screen.pack(side="left", padx=(14, 5))
+        self.chk_screen.pack(side="left", padx=(6, 5))
 
         self.var_mic = tk.BooleanVar(value=USAR_MIC)
         self.chk_mic = tk.Checkbutton(
@@ -1183,7 +1721,7 @@ class TranscriptorApp:
         device_info = "GPU CUDA" if device == "cuda" else f"CPU ({WHISPER_THREADS} hilos)"
         self.lbl_motor_info = tk.Label(
             vu_frame,
-            text=f"Motor: faster-whisper {MODEL_SIZE} ({device_info})  |  [Tú]=azul  [Ellos]=verde  |  🐌 OpenTralla v2.0 Pro",
+            text=f"Motor: faster-whisper {MODEL_SIZE} ({device_info})  |  [Tú]=azul  [Ellos]=verde  |  🐌 OpenTralla v2.2",
             font=("Segoe UI",8), fg=C.MUTED, bg="#0f1b30"
         )
         self.lbl_motor_info.pack(pady=(2,0))
@@ -1195,7 +1733,7 @@ class TranscriptorApp:
         tk.Label(leg, text="Tú (micrófono)", fg=C.MUTED, bg=C.BG, font=("Segoe UI",9)).pack(side="left")
         tk.Label(leg, text="   ●", fg=C.COLOR_ELLOS, bg=C.BG, font=("Segoe UI",10,"bold")).pack(side="left", padx=(8,2))
         tk.Label(leg, text="Ellos (llamada/sistema)", fg=C.MUTED, bg=C.BG, font=("Segoe UI",9)).pack(side="left")
-        tk.Label(leg, text="   🛡️ Auto-guardado activo | Dual-channel | Callback mode", fg="#22c55e", bg=C.BG, font=("Segoe UI",9)).pack(side="left", padx=8)
+        tk.Label(leg, text="   💾 El audio se escribe a disco en grabaciones/ mientras hablas", fg="#22c55e", bg=C.BG, font=("Segoe UI",9)).pack(side="left", padx=8)
 
         # Área de texto con tags de color
         ft = tk.Frame(self.root, bg=C.BG, padx=12, pady=6)
@@ -1259,14 +1797,15 @@ class TranscriptorApp:
         """Genera la transcripción con formato profesional y separadores claros."""
         duracion = ""
         if self._start_time:
-            delta = datetime.datetime.now() - self._start_time
+            fin = self._end_time or datetime.datetime.now()
+            delta = fin - self._start_time
             horas, rem = divmod(int(delta.total_seconds()), 3600)
             mins, secs = divmod(rem, 60)
             duracion = f"{horas:02d}:{mins:02d}:{secs:02d}"
         
         header = (
             "════════════════════════════════════════════════════════════════\n"
-            "  OpenTralla v2.0 — Transcripción Profesional de Llamada\n"
+            "  OpenTralla v2.2 — Transcripción de Llamada\n"
             f"  Fecha: {datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n"
         )
         if duracion:
@@ -1306,13 +1845,14 @@ class TranscriptorApp:
         Formato profesional para procesamiento automático."""
         duracion = ""
         if self._start_time:
-            delta = datetime.datetime.now() - self._start_time
+            fin = self._end_time or datetime.datetime.now()
+            delta = fin - self._start_time
             horas, rem = divmod(int(delta.total_seconds()), 3600)
             mins, secs = divmod(rem, 60)
             duracion = f"{horas:02d}:{mins:02d}:{secs:02d}"
         
         return {
-            "version": "2.0",
+            "version": "2.2",
             "app": "OpenTralla",
             "fecha": datetime.datetime.now().isoformat(),
             "duracion": duracion,
@@ -1353,10 +1893,18 @@ class TranscriptorApp:
     # Acciones
     # ──────────────────────────────────────────────────────────────────────────
     def iniciar(self):
-        if not model_ready.is_set():
-            messagebox.showwarning("Espera", "El modelo aún se está cargando.")
+        if self.grabando or self._transcribiendo: return
+        if LIVE_TRANSCRIBE and not modelo_vigente():
+            messagebox.showwarning("Espera",
+                "El modelo aún se está cargando.\n\n"
+                "Si tienes prisa, desactiva «⚡ Transcribir en vivo» y graba ya mismo.")
             return
-        if self.grabando: return
+        if self.sesion is not None and self.sesion.tiene_audio() and not self.transcripcion:
+            if not messagebox.askyesno("Grabación sin transcribir",
+                "La grabación anterior todavía no está transcrita.\n\n"
+                f"No se borra, queda guardada en:\n{self.sesion.carpeta}\n\n"
+                "¿Empezar una grabación nueva?"):
+                return
 
         if self.var_screen.get():
             ok, msg = _check_screen_deps()
@@ -1377,28 +1925,48 @@ class TranscriptorApp:
     def _arrancar(self):
         self.grabando = True
         self._start_time = datetime.datetime.now()
+        self._end_time   = None
         stop_event.clear()
-        audio_buf_mic.clear()
-        audio_buf_loop.clear()
+        offline_cancel.clear()
+        # Nueva sesión en disco: aquí se va escribiendo el audio mientras hablas
+        self.sesion = SesionGrabacion.nueva()
+        self._start_time = self.sesion.inicio
         while not phrase_queue.empty():
             try: phrase_queue.get_nowait()
             except: break
-        self.btn_ini.config(state="disabled")
-        self.btn_det.config(state="normal")
+        self._estado_botones()
         self._parpadear()
-        # Iniciar auto-guardado
-        self._autosave_id = self.root.after(AUTOSAVE_INTERVAL * 1000, self._autosave)
-        self.var_autosave.set("🛡️ Auto-guardado activo")
         usar_mic = self.var_mic.get()
-        threading.Thread(target=hilo_captura,
-                         args=(self._status, self._update_vu, usar_mic), daemon=True).start()
-        threading.Thread(target=hilo_transcripcion,
-                         args=(self._agregar, self._status), daemon=True).start()
+
+        if LIVE_TRANSCRIBE:
+            # Auto-guardado del texto (solo tiene sentido si hay texto en vivo)
+            self._autosave_id = self.root.after(AUTOSAVE_INTERVAL * 1000, self._autosave)
+            self.var_autosave.set("🛡️ Auto-guardado activo")
+            threading.Thread(target=hilo_transcripcion,
+                             args=(self._agregar, self._status), daemon=True).start()
+        else:
+            # Modo grabadora: saca Whisper de la RAM para no estorbar la llamada
+            if model_ready.is_set():
+                liberar_modelo()
+            self.var_autosave.set("🎙️ Grabando audio (sin transcribir)")
+
+        self._hilo_captura = threading.Thread(
+            target=hilo_captura,
+            args=(self._status, self._update_vu, usar_mic, LIVE_TRANSCRIBE, self.sesion),
+            daemon=True)
+        self._hilo_captura.start()
 
     def detener(self):
         if not self.grabando: return
         stop_event.set()
         self.grabando = False
+        self._end_time = datetime.datetime.now()
+        # Esperar a que el hilo de captura vacíe sus buffers y cierre los archivos
+        if self._hilo_captura is not None:
+            self._hilo_captura.join(timeout=3.0)
+            self._hilo_captura = None
+        if self.sesion is not None:
+            self.sesion.cerrar()   # idempotente, por si el hilo no llegó a hacerlo
         if getattr(self, "_screen_rec", None):
             self._screen_rec.stop()
         if getattr(self, "_region_win", None):
@@ -1410,16 +1978,25 @@ class TranscriptorApp:
         if self._autosave_id:
             self.root.after_cancel(self._autosave_id)
             self._autosave_id = None
-        # Auto-guardado final al detener
-        self._autosave(force=True)
-        self.var_autosave.set(f"🛡️ Último guardado: {datetime.datetime.now().strftime('%H:%M:%S')}")
-        self.btn_ini.config(state="normal")
-        self.btn_det.config(state="disabled")
+        # Auto-guardado final al detener (solo si hubo transcripción en vivo)
+        if self.transcripcion:
+            self._autosave(force=True)
+            self.var_autosave.set(f"🛡️ Último guardado: {datetime.datetime.now().strftime('%H:%M:%S')}")
         self.var_rec.set("")
         self._draw_vu(0.0)
+        self._estado_botones()
+        if self.sesion is not None:
+            mins = self.sesion.duracion_seg() / 60
+            self.var_autosave.set(
+                f"💾 En disco: {os.path.basename(self.sesion.carpeta)} "
+                f"({self.sesion.tamano_mb():.0f} MB)")
+            if not LIVE_TRANSCRIBE:
+                self._status(f"✅ Grabación lista ({mins:.1f} min) — "
+                             "pulsa «📝 Transcribir» cuando quieras")
 
     def _cargar_modelo_async(self):
-        self.btn_ini.config(state="disabled")
+        self._cargando_modelo = True
+        self._estado_botones()
         
         def on_status(msg):
             self._status(msg)
@@ -1427,9 +2004,10 @@ class TranscriptorApp:
             if "✅" in msg or "❌" in msg:
                 device, _ = get_whisper_device()
                 device_info = "GPU CUDA" if device == "cuda" else f"CPU ({WHISPER_THREADS} hilos)"
-                motor_info = f"Motor: faster-whisper {MODEL_SIZE} ({device_info})  |  [Tú]=azul  [Ellos]=verde  |  🐌 OpenTralla v2.0 Pro"
+                motor_info = f"Motor: faster-whisper {MODEL_SIZE} ({device_info})  |  [Tú]=azul  [Ellos]=verde  |  🐌 OpenTralla v2.2"
                 self.root.after(0, lambda info=motor_info: self.lbl_motor_info.config(text=info))
-                self.root.after(0, lambda: self.btn_ini.config(state="normal"))
+                self._cargando_modelo = False
+                self.root.after(0, self._estado_botones)
                 
         threading.Thread(target=cargar_modelo, args=(on_status,), daemon=True).start()
 
@@ -1449,7 +2027,41 @@ class TranscriptorApp:
         cfg["whisper_model_size"] = MODEL_SIZE
         save_config(cfg)
         
-        self._cargar_modelo_async()
+        # Carga perezosa: solo recargamos ya si la transcripción en vivo está activa
+        liberar_modelo()
+        if LIVE_TRANSCRIBE:
+            self._cargar_modelo_async()
+        else:
+            self._status(f"⚙️ Modelo '{MODEL_SIZE}' se cargará al pulsar «Transcribir»")
+
+    def _on_live_toggle(self):
+        """Enciende/apaga la transcripción en tiempo real durante la llamada."""
+        global LIVE_TRANSCRIBE
+        if self.grabando or self._transcribiendo:
+            messagebox.showwarning("Ocupado",
+                "No puedes cambiar el modo mientras graba o transcribe.")
+            self.var_live.set(LIVE_TRANSCRIBE)
+            return
+        LIVE_TRANSCRIBE = self.var_live.get()
+        cfg = load_config()
+        cfg["transcripcion_vivo"] = LIVE_TRANSCRIBE
+        save_config(cfg)
+
+        if LIVE_TRANSCRIBE:
+            self.lbl_live_info.config(text="⚠️ usa CPU durante la llamada", fg=self.RED)
+            messagebox.showwarning("Transcripción en vivo",
+                "Whisper correrá DURANTE la llamada.\n\n"
+                "En equipos justos eso consume CPU y puede degradar el audio de "
+                "Zoom/Teams (voz robotizada, cortes).\n\n"
+                "Si notas problemas, desactívalo y usa «📝 Transcribir» al colgar: "
+                "sale igual de bien o mejor, porque Whisper ve la llamada entera.")
+            if not modelo_vigente():
+                self._cargar_modelo_async()
+        else:
+            self.lbl_live_info.config(text="CPU libre — transcribes al final", fg="#22c55e")
+            liberar_modelo()   # devuelve la RAM del modelo
+            self._status("✅ Modo grabadora — Whisper se carga al transcribir")
+        self._estado_botones()
 
     def _on_mic_toggle(self):
         global USAR_MIC
@@ -1474,7 +2086,120 @@ class TranscriptorApp:
         cfg["whisper_cpu_threads"] = WHISPER_THREADS
         save_config(cfg)
         
-        self._cargar_modelo_async()
+        # Carga perezosa: solo recargamos ya si la transcripción en vivo está activa
+        liberar_modelo()
+        if LIVE_TRANSCRIBE:
+            self._cargar_modelo_async()
+        else:
+            self._status(f"⚙️ Modelo '{MODEL_SIZE}' se cargará al pulsar «Transcribir»")
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Transcripción diferida (el flujo por defecto)
+    # ──────────────────────────────────────────────────────────────────────────
+    def _estado_botones(self):
+        """Único sitio que decide qué botón está activo en cada momento."""
+        hay_audio = bool(self.sesion is not None and self.sesion.tiene_audio())
+        if self._transcribiendo:
+            self.btn_ini.config(state="disabled")
+            self.btn_det.config(state="disabled")
+            self.btn_trans.config(state="normal", text="⏹  Cancelar", bg=self.RED)
+        elif self.grabando:
+            self.btn_ini.config(state="disabled")
+            self.btn_det.config(state="normal")
+            self.btn_trans.config(state="disabled", text="📝  Transcribir", bg=self.BLUE)
+        else:
+            self.btn_ini.config(state="disabled" if self._cargando_modelo else "normal")
+            self.btn_det.config(state="disabled")
+            self.btn_trans.config(state="normal" if hay_audio else "disabled",
+                                  text="📝  Transcribir", bg=self.BLUE)
+
+    def _revisar_pendientes(self):
+        """Al abrir la app: ofrecer la última grabación que quedó sin transcribir.
+        Es lo que te salva si la app se cerró sola o se fue la luz."""
+        try:
+            pendientes = sesiones_pendientes()
+        except Exception:
+            return
+        if not pendientes:
+            return
+        s = pendientes[0]
+        mins = s.duracion_seg() / 60
+        cuando = s.inicio.strftime("%d/%m/%Y %H:%M") if s.inicio else "fecha desconocida"
+        extra = (f"\n\n(Hay {len(pendientes)} grabaciones sin transcribir en total; "
+                 "las demás siguen en la carpeta.)") if len(pendientes) > 1 else ""
+        if messagebox.askyesno("Grabación sin transcribir",
+            f"Encontré una grabación guardada que no llegaste a transcribir:\n\n"
+            f"    {cuando}  —  {mins:.1f} min  ({s.tamano_mb():.0f} MB)\n"
+            f"    {s.carpeta}\n\n"
+            f"¿La cargo para poder transcribirla ahora?{extra}"):
+            self.sesion = s
+            self._start_time = s.inicio
+            if s.inicio:
+                self._end_time = s.inicio + datetime.timedelta(seconds=s.duracion_seg())
+            self._estado_botones()
+            self._status(f"📂 Grabación cargada ({mins:.1f} min) — pulsa «📝 Transcribir»")
+            self.var_autosave.set(f"💾 {os.path.basename(s.carpeta)}")
+
+    def abrir_carpeta(self):
+        """Abre en el Explorador la carpeta donde se guardan las grabaciones."""
+        destino = GRAB_DIR
+        if self.sesion is not None and os.path.isdir(self.sesion.carpeta):
+            destino = self.sesion.carpeta
+        try:
+            os.makedirs(destino, exist_ok=True)
+            os.startfile(destino)
+        except Exception as e:
+            messagebox.showwarning("No se pudo abrir la carpeta", f"{destino}\n\n{e}")
+
+    def transcribir_offline(self):
+        """Transcribe la grabación ya terminada. Segunda pulsación = cancelar."""
+        if self._transcribiendo:
+            offline_cancel.set()
+            self._status("⏹️ Cancelando transcripción…")
+            return
+        if self.grabando:
+            messagebox.showwarning("Grabación activa",
+                "Pulsa «⏹ Detener» antes de transcribir.")
+            return
+        if self.sesion is None or not self.sesion.tiene_audio():
+            messagebox.showinfo("Sin grabación",
+                "No hay audio grabado.\n\n"
+                "Pulsa «▶ Iniciar», haz la llamada, detén y vuelve aquí.")
+            return
+        if self.transcripcion:
+            if not messagebox.askyesno("Ya hay texto",
+                "La ventana ya tiene una transcripción.\n\n"
+                "¿Borrarla y transcribir la grabación desde cero?"):
+                return
+            self.limpiar()
+
+        self._transcribiendo = True
+        self._estado_botones()
+        threading.Thread(
+            target=transcribir_grabacion,
+            args=(self.sesion, self._agregar, self._status, self._offline_done,
+                  self._start_time),
+            daemon=True).start()
+
+    def _offline_done(self, estado: str, mensaje: str):
+        """Cierre de la transcripción diferida (llega desde el hilo de trabajo)."""
+        def _fin():
+            self._transcribiendo = False
+            self._estado_botones()
+            if estado == "ok":
+                self._status(f"✅ {mensaje}   —   pulsa «💾 Guardar»")
+                self._autosave(force=True)
+                if self.sesion is not None:
+                    self.sesion.marcar_listo()
+            elif estado == "cancelado":
+                self._status(f"⏹️ {mensaje}")
+            elif estado == "vacio":
+                self._status("⚠️ La grabación está vacía")
+                messagebox.showwarning("Sin audio", mensaje)
+            else:
+                self._status(f"❌ {mensaje}")
+                messagebox.showerror("Error transcribiendo", mensaje)
+        self.root.after(0, _fin)
 
     def abrir_ia(self):
         transcript = "".join(self.transcripcion)
@@ -1485,34 +2210,48 @@ class TranscriptorApp:
         AIDialog(self.root, transcript)
 
     def guardar(self):
-        if not self.transcripcion:
-            messagebox.showinfo("Sin contenido", "No hay texto para guardar."); return
+        hay_audio = bool(self.sesion is not None and self.sesion.tiene_audio())
+        if not self.transcripcion and not hay_audio:
+            messagebox.showinfo("Sin contenido",
+                "No hay nada que guardar todavía.\n\nGraba una llamada primero.")
+            return
+        solo_audio = not self.transcripcion
+        if solo_audio:
+            if not messagebox.askyesno("Sin transcripción",
+                "Esta grabación todavía no está transcrita.\n\n"
+                "¿Guardar solo el audio (.wav)?\n\n"
+                "También puedes cancelar, pulsar «📝 Transcribir» y guardar después."):
+                return
         ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         path = filedialog.asksaveasfilename(
-            defaultextension=".txt",
-            filetypes=[("Texto","*.txt"),("Todos","*.*")],
-            initialfile=f"opentralla_{ts}.txt")
+            defaultextension=".wav" if solo_audio else ".txt",
+            filetypes=([("Audio WAV","*.wav"),("Todos","*.*")] if solo_audio
+                       else [("Texto","*.txt"),("Todos","*.*")]),
+            initialfile=f"opentralla_{ts}." + ("wav" if solo_audio else "txt"))
         if not path: return
         
         base = os.path.splitext(path)[0]
 
-        # 1. Transcripción formateada (.txt)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(self._generar_transcripcion_formateada())
-
-        # 1b. Transcripción estructurada (.json)
+        # 1. Transcripción formateada (.txt) — solo si ya hay texto
+        ok_txt    = False
+        ok_json   = False
         json_path = base + ".json"
-        ok_json = False
-        try:
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(self._generar_json_estructurado(), f, indent=2, ensure_ascii=False)
-            ok_json = True
-        except Exception as e:
-            print(f"Error guardando JSON estructurado: {e}")
+        if self.transcripcion:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self._generar_transcripcion_formateada())
+            ok_txt = True
+
+            # 1b. Transcripción estructurada (.json)
+            try:
+                with open(json_path, "w", encoding="utf-8") as f:
+                    json.dump(self._generar_json_estructurado(), f, indent=2, ensure_ascii=False)
+                ok_json = True
+            except Exception as e:
+                print(f"Error guardando JSON estructurado: {e}")
 
         # 2. Audio completo de la llamada (.wav) — mezcla de ambos canales
         wav_path = base + ".wav"
-        ok_wav = self._guardar_wav_mixto(wav_path)
+        ok_wav = escribir_wav_mezcla(self.sesion, wav_path) if self.sesion else False
 
         # 3. Video (.mp4) — SOLO si la grabación de pantalla estaba activa
         ok_mp4, mp4_path = False, ""
@@ -1521,125 +2260,33 @@ class TranscriptorApp:
             if os.path.exists(wav_path):
                 ok_mp4 = self._muxear_video(self._screen_rec.video_path, wav_path, mp4_path)
 
-        msg = f"📄 Transcripción:\n{path}"
+        msg = (f"📄 Transcripción:\n{path}" if ok_txt
+               else "📄 Sin transcripción todavía (solo se guardó el audio).\n"
+                    "Pulsa «📝 Transcribir» y vuelve a guardar.")
         if ok_json:
             msg += f"\n\n📊 JSON estructurado:\n{json_path}"
         if ok_wav:
             msg += f"\n\n🔊 Audio de la llamada:\n{wav_path}"
+        else:
+            msg += "\n\n⚠️ No se pudo guardar el audio (¿grabación vacía?)"
         if ok_mp4:
             msg += f"\n\n🎬 Video con pantalla:\n{mp4_path}"
         elif self._screen_rec:
             msg += "\n\n⚠️ No se pudo generar el video (verifica que ffmpeg.exe esté en la carpeta)"
         messagebox.showinfo("Guardado", msg)
 
-    def _guardar_wav_separado(self, path: str, buf: list, rate: int) -> bool:
-        """Guarda un stream de audio individual como WAV a su tasa nativa."""
-        if not buf:
-            return False
-        try:
-            all_audio = np.concatenate(buf).astype(np.float32)
-            pcm = np.clip(all_audio * 32767, -32768, 32767).astype(np.int16)
-            with wave.open(path, "w") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(rate)
-                wf.writeframes(pcm.tobytes())
-            return True
-        except Exception as e:
-            print(f"Error guardando WAV {path}: {e}")
-            return False
-    
-    def _guardar_wav_dual_channel(self, path: str) -> bool:
-        """Guarda WAV estéreo dual-channel: canal izquierdo = Tú, canal derecho = Ellos.
-        
-        Técnica profesional usada por Twilio, call centers y estudios de grabación.
-        Permite post-procesar cada voz por separado al importar en cualquier editor de audio."""
-        if not audio_buf_mic and not audio_buf_loop:
-            return False
-        try:
-            # Obtener ambos streams
-            mic_audio  = np.concatenate(audio_buf_mic).astype(np.float32) if audio_buf_mic else np.zeros(0, dtype=np.float32)
-            loop_audio = np.concatenate(audio_buf_loop).astype(np.float32) if audio_buf_loop else np.zeros(0, dtype=np.float32)
-            
-            # Normalizar a la misma tasa (usar la mayor para calidad)
-            target_rate = max(native_rate_mic, native_rate_loop)
-            
-            if native_rate_mic != target_rate and len(mic_audio) > 0:
-                nl = int(len(mic_audio) * target_rate / native_rate_mic)
-                ix = np.linspace(0, len(mic_audio) - 1, nl)
-                mic_audio = np.interp(ix, np.arange(len(mic_audio)), mic_audio).astype(np.float32)
-            
-            if native_rate_loop != target_rate and len(loop_audio) > 0:
-                nl = int(len(loop_audio) * target_rate / native_rate_loop)
-                ix = np.linspace(0, len(loop_audio) - 1, nl)
-                loop_audio = np.interp(ix, np.arange(len(loop_audio)), loop_audio).astype(np.float32)
-            
-            # Igualar longitudes
-            max_len = max(len(mic_audio), len(loop_audio))
-            if max_len == 0:
-                return False
-            
-            left  = np.zeros(max_len, dtype=np.float32)  # Canal izquierdo = Tú
-            right = np.zeros(max_len, dtype=np.float32)  # Canal derecho = Ellos
-            left[:len(mic_audio)]   = mic_audio
-            right[:len(loop_audio)] = loop_audio
-            
-            # Intercalar muestras L-R-L-R (formato estéreo PCM)
-            stereo = np.empty(max_len * 2, dtype=np.float32)
-            stereo[0::2] = left
-            stereo[1::2] = right
-            
-            pcm = np.clip(stereo * 32767, -32768, 32767).astype(np.int16)
-            with wave.open(path, "w") as wf:
-                wf.setnchannels(2)  # ← ESTÉREO
-                wf.setsampwidth(2)
-                wf.setframerate(target_rate)
-                wf.writeframes(pcm.tobytes())
-            return True
-        except Exception as e:
-            print(f"Error guardando WAV dual-channel: {e}")
-            return False
-    
-    def _guardar_wav_mixto(self, path: str) -> bool:
-        """Guarda un WAV con ambos streams mezclados (para referencia rápida)."""
-        if not audio_buf_mic and not audio_buf_loop:
-            return False
-        try:
-            mic_audio  = np.concatenate(audio_buf_mic).astype(np.float32) if audio_buf_mic else np.zeros(0, dtype=np.float32)
-            loop_audio = np.concatenate(audio_buf_loop).astype(np.float32) if audio_buf_loop else np.zeros(0, dtype=np.float32)
-            
-            # Normalizar tasas
-            target_rate = max(native_rate_mic, native_rate_loop)
-            
-            if native_rate_mic != target_rate and len(mic_audio) > 0:
-                nl = int(len(mic_audio) * target_rate / native_rate_mic)
-                ix = np.linspace(0, len(mic_audio) - 1, nl)
-                mic_audio = np.interp(ix, np.arange(len(mic_audio)), mic_audio).astype(np.float32)
-            
-            if native_rate_loop != target_rate and len(loop_audio) > 0:
-                nl = int(len(loop_audio) * target_rate / native_rate_loop)
-                ix = np.linspace(0, len(loop_audio) - 1, nl)
-                loop_audio = np.interp(ix, np.arange(len(loop_audio)), loop_audio).astype(np.float32)
-            
-            # Mezclar
-            max_len = max(len(mic_audio), len(loop_audio))
-            if max_len == 0:
-                return False
-            mixed = np.zeros(max_len, dtype=np.float32)
-            mixed[:len(loop_audio)] += loop_audio * 0.7
-            mixed[:len(mic_audio)]  += mic_audio * 0.7
-            mixed = np.clip(mixed, -1, 1)
-            
-            pcm = np.clip(mixed * 32767, -32768, 32767).astype(np.int16)
-            with wave.open(path, "w") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(target_rate)
-                wf.writeframes(pcm.tobytes())
-            return True
-        except Exception as e:
-            print(f"Error guardando WAV mixto: {e}")
-            return False
+        # El audio ya está a salvo en el .wav: ofrecer liberar los temporales
+        if ok_wav and self.sesion is not None:
+            self.sesion.marcar_listo()
+            mb = self.sesion.tamano_mb()
+            if mb >= 1 and messagebox.askyesno("Liberar espacio",
+                f"El audio ya quedó guardado en:\n{wav_path}\n\n"
+                f"¿Borro los archivos de trabajo de la grabación ({mb:.0f} MB)?\n"
+                f"{self.sesion.carpeta}\n\n"
+                "(Si dices que no, se quedan por si quieres volver a transcribirla.)"):
+                if self.sesion.borrar():
+                    self.sesion = None
+                    self._estado_botones()
 
     def _muxear_video(self, video_tmp: str, wav_path: str, out_path: str) -> bool:
         ffmpeg = _find_ffmpeg()
@@ -1743,6 +2390,12 @@ class TranscriptorApp:
 
     def on_close(self):
         if self.grabando: self.detener()
+        if self._transcribiendo:
+            if not messagebox.askyesno("Transcripción en curso",
+                "Se está transcribiendo la grabación.\n\n¿Cerrar de todas formas?"):
+                return
+            offline_cancel.set()
+        stop_event.set()
         self.root.destroy()
 
 

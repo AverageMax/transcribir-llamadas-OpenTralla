@@ -1,27 +1,55 @@
-# 🐌 OpenTralla v2.0 Pro — Transcriptor Profesional de Llamadas
+# 🐌 OpenTralla v2.2 — Grabadora + Transcriptor de Llamadas
 
 ![OpenTralla Interfaz](screenshot.png)
 
-Transcribe reuniones de **Google Meet, Zoom, Teams** (o cualquier audio del sistema) directamente en tu PC, **100% local y sin costo**. Grabación de calidad profesional con separación de hablantes.
+Graba y transcribe reuniones de **Google Meet, Zoom, Teams** (o cualquier audio del sistema) directamente en tu PC, **100% local y sin costo**, con separación de hablantes.
 
 ---
 
-## 🚀 Novedades v2.0 Pro
+## 🚀 Novedades v2.2 — Graba primero, transcribe después
 
-> **Reescritura completa del motor de audio** usando técnicas profesionales de grabación de llamadas inspiradas en **Twilio**, **Zoom** y call centers.
+En v2.0 Whisper corría **durante** la llamada. En equipos justos eso saturaba la CPU y el efecto se oía al otro lado: **voz robotizada, cortes y ruido**. La v2.2 le da la vuelta al flujo.
 
-### ⚡ Antes vs Ahora
-
-| Problema en v1 | Solución en v2.0 Pro |
+| Antes (v2.0) | Ahora (v2.2) |
 |---|---|
-| 🔴 **Chasquidos/crujidos** al iniciar grabación | ✅ **Modo Callback WASAPI** — el driver de audio entrega datos sin bloqueo |
-| 🔴 Buffer de 512 frames causaba **underruns** | ✅ Buffer de **2048 frames** — margen amplio para CPU |
-| 🔴 Resampleo forzado a 16kHz **destruía calidad** | ✅ Captura a **tasa nativa** (44100/48000Hz) del dispositivo |
-| 🔴 **Se perdía tu voz** — cancelación de eco rompía la señal | ✅ **Detección inteligente** con ratios adaptativos |
-| 🔴 Pop/clic al presionar Iniciar | ✅ **Fade-in de 15ms** anti-pop |
-| 🔴 Si se cerraba la app, **se perdía todo** | ✅ **Auto-guardado cada 30s** a carpeta `_autosave/` |
-| 🔴 Solo 1 archivo WAV mezclado | ✅ **4 archivos WAV** separados + **dual-channel estéreo** |
-| 🔴 Transcripción plana sin formato | ✅ **Formato profesional** con separadores + **JSON estructurado** |
+| 🔴 Whisper transcribía **durante** la llamada y comía CPU | ✅ **Modo grabadora** por defecto: durante la llamada solo se graba audio. Cero Whisper, cero VAD |
+| 🔴 El modelo se cargaba al abrir la app (~30 s de espera) | ✅ **Carga perezosa**: la app abre al instante, Whisper se carga al pulsar «📝 Transcribir» |
+| 🔴 El audio se acumulaba en RAM (~1,4 GB por hora) | ✅ **Se escribe a disco** según entra: una llamada de 3 h gasta lo mismo que una de 3 min |
+| 🔴 Si la app se cerraba, el audio se perdía | ✅ El audio ya está en disco; al reabrir, la app **te ofrece la grabación pendiente** |
+| 🔴 El audio de la llamada podía quedar **desfasado** del micrófono | ✅ Los huecos del loopback se rellenan con silencio: ambos canales quedan sincronizados |
+| 🔴 Transcripción frase a frase, sin contexto | ✅ Whisper recibe la **llamada entera**: mejor contexto y mejor puntuación |
+
+> ¿Prefieres verlo en vivo? El interruptor **⚡ Transcribir en vivo** sigue ahí. Está apagado por defecto y avisa del coste en CPU.
+
+---
+
+## 🚀 Uso
+
+### El flujo normal (recomendado)
+
+1. **Inicia la llamada** en Meet/Zoom/Teams
+2. **▶ Iniciar** → OpenTralla graba tu micrófono y el audio de la llamada. Nada más: la CPU queda libre
+3. **⏹ Detener** al colgar
+4. **📝 Transcribir** → ahora sí carga Whisper y transcribe todo, con progreso en pantalla
+5. **💾 Guardar** → genera `.txt`, `.json` y `.wav`
+
+Mientras transcribe, ese mismo botón pasa a **⏹ Cancelar**. El texto va apareciendo a medida que avanza.
+
+### Si quieres verlo en tiempo real
+
+Activa **⚡ Transcribir en vivo** antes de empezar. Ten en cuenta que Whisper competirá por la CPU con la videollamada.
+
+### Botones
+
+| Botón | Qué hace |
+|---|---|
+| ▶ **Iniciar** | Empieza a grabar (mic + audio del sistema) |
+| ⏹ **Detener** | Para la grabación |
+| 📝 **Transcribir** | Transcribe la grabación terminada. Vuelve a pulsarlo para cancelar |
+| 🤖 **Analizar con IA** | Resumen, puntos clave o tareas sobre la transcripción |
+| 💾 **Guardar** | Exporta transcripción y audio donde tú elijas |
+| 🗑️ **Limpiar** | Borra el texto de la ventana (la grabación sigue en disco) |
+| 📂 **Grabaciones** | Abre la carpeta donde está el audio |
 
 ---
 
@@ -30,46 +58,38 @@ Transcribe reuniones de **Google Meet, Zoom, Teams** (o cualquier audio del sist
 | Función | Detalle |
 |---|---|
 | 🎙️ **Diarización** | Distingue quién habla: `[Tú]` en azul (micrófono) y `[Ellos]` en verde (llamada) |
-| ⚡ **Modo Callback** | Captura no-bloqueante que elimina chasquidos y crujidos |
-| 🎧 **Dual-Channel** | Grabación estéreo profesional: tu voz en canal izquierdo, ellos en canal derecho (como Twilio) |
-| 🔊 **Tasa Nativa** | Captura a la tasa real del dispositivo (44100/48000Hz) — sin resampleo destructivo |
-| 🛡️ **Anti-Pérdida** | Auto-guardado cada 30 segundos — nunca pierdes nada |
+| 💾 **Grabación en disco** | El audio se escribe según entra. RAM plana y a prueba de cierres inesperados |
+| ⚡ **Modo Callback** | Captura WASAPI no-bloqueante que elimina chasquidos y crujidos |
+| 🔊 **Tasa Nativa** | Captura a la tasa real del dispositivo (44100/48000 Hz) — sin resampleo destructivo |
+| 🔗 **Streams sincronizados** | Se rellenan con silencio los tramos en que el sistema no reproduce nada |
+| 🛡️ **Anti-Pérdida** | Volcado a disco cada 10 s + recuperación de grabaciones pendientes al abrir |
 | 🎬 **Grabar Pantalla** | Captura de video opcional de la zona que elijas (redimensionable) |
 | 🤖 **Análisis con IA** | Resumir, extraer puntos clave o tareas con Gemini, Claude, OpenAI u Ollama |
 | 📊 **VU meter** | Visualiza el nivel de audio en tiempo real |
 | 🎚️ **Umbral ajustable** | Slider para calibrar la sensibilidad del VAD sin reiniciar |
-| 💾 **Guardado Pro** | Exporta: `.txt` formateado, `.json` estructurado, 4 archivos WAV + video `.mp4` |
 
 ---
 
-## 🏗️ Arquitectura Profesional
-
-OpenTralla usa las mismas técnicas de grabación que las grandes plataformas:
-
-| Técnica | Twilio/Zoom | OpenTralla v2.0 |
-|---|---|---|
-| **Canales separados** | `RecordingChannels=dual` | Streams independientes mic/loopback |
-| **Sin pérdida** | Almacenamiento en la nube | Auto-guardado local cada 30s |
-| **Modo no-bloqueante** | Media servers dedicados | Callbacks WASAPI nativos |
-| **Calidad nativa** | Codecs Opus adaptativos | Captura a tasa nativa del dispositivo |
-| **Dual-channel** | Izq=agente, Der=cliente | Izq=Tú, Der=Ellos |
-
-### Flujo de audio
+## 🏗️ Cómo funciona por dentro
 
 ```
-┌─────────────┐     Callback      ┌──────────────┐
-│  Micrófono   │────(no-bloquea)──→│  Cola Mic     │──→ Buffer Mic ──→ _tu.wav
-│  (tu voz)    │                   └──────────────┘          │
-└─────────────┘                                              │
-                                                    ┌────────▼────────┐
-                                                    │  VAD + Diariz.  │──→ Whisper 16kHz
-                                                    │  (hilo aparte)  │──→ Transcripción
-                                                    └────────▲────────┘
-┌─────────────┐     Callback      ┌──────────────┐          │
-│  Loopback    │────(no-bloquea)──→│  Cola Loop    │──→ Buffer Loop ──→ _ellos.wav
-│  (WASAPI)    │                   └──────────────┘
-└─────────────┘
+┌──────────────┐   Callback    ┌───────────┐
+│  Micrófono    │──(no bloquea)→│ Cola Mic  │──┐
+│  (tu voz)     │               └───────────┘  │   ┌──────────────────────┐
+└──────────────┘                               ├──→│ grabaciones/sesion_…  │
+┌──────────────┐   Callback    ┌───────────┐   │   │   tu.pcm  ellos.pcm   │
+│  Loopback     │──(no bloquea)→│ Cola Loop │──┘   └──────────┬───────────┘
+│  (WASAPI)     │               └───────────┘                 │
+└──────────────┘                                              │
+                                        ┌─────────────────────▼──────────────┐
+   ⚡ solo si activas «en vivo»          │  📝 Transcribir (al colgar)         │
+   ┌──────────────────────┐             │  · lee por bloques a 16 kHz         │
+   │ VAD + Whisper por    │             │  · Whisper sobre la llamada entera  │
+   │ frases, en la llamada│             │  · diarización por franjas de tiempo│
+   └──────────────────────┘             └─────────────────────────────────────┘
 ```
+
+**Por qué a disco y en PCM crudo:** un `.pcm` sin cabecera no se puede corromper. Si la app se cierra de golpe, el archivo sigue siendo válido hasta el último byte escrito — no hay ninguna cabecera que reparar. El `.wav` final se genera al guardar, leyendo por bloques.
 
 ---
 
@@ -89,34 +109,37 @@ instalar.bat
 iniciar.bat
 ```
 
-Al primer inicio se descarga automáticamente el modelo de Whisper. Espera a que el estado diga **"Modelo listo"**.
+La app abre al instante. El modelo de Whisper se descarga la primera vez que pulses **📝 Transcribir** (solo necesitas internet esa vez).
 
 ---
 
-## 🚀 Uso
+## 📦 Archivos
 
-1. **Inicia la llamada** en Meet/Zoom/Teams
-2. **Presiona ▶ Iniciar**
-3. Las frases aparecen en tiempo real con separadores visuales por hablante
-4. **Presiona ⏹ Detener** cuando termines
-5. **💾 Guardar** → genera automáticamente todos los archivos
-
-### 📦 Archivos generados al guardar
+### Mientras grabas — `grabaciones/sesion_AAAAMMDD_HHMMSS/`
 
 | Archivo | Contenido |
 |---|---|
-| `_FECHA.txt` | Transcripción formateada con cabecera y separadores por hablante |
-| `_FECHA.json` | Transcripción estructurada con estadísticas y turnos |
-| `_FECHA_tu.wav` | 🎤 Solo TU voz (micrófono) a calidad nativa |
-| `_FECHA_ellos.wav` | 🔊 Solo la voz de ELLOS (loopback) a calidad nativa |
-| `_FECHA_dual.wav` | 🎧 **Estéreo dual-channel**: Tú=izquierdo, Ellos=derecho |
-| `_FECHA_mixto.wav` | 🔀 Ambos mezclados para referencia rápida |
-| `_FECHA.mp4` | 🎬 Video sincronizado (solo si activaste grabación de pantalla) |
+| `ellos.pcm` | 🔊 Audio de la videollamada (loopback del sistema) |
+| `tu.pcm` | 🎤 Tu micrófono |
+| `sesion.json` | Tasas de muestreo, hora de inicio y si hubo micrófono |
+
+Esta carpeta está en `.gitignore`: el audio de tus llamadas nunca se sube al repositorio.
+
+### Al pulsar 💾 Guardar
+
+| Archivo | Contenido |
+|---|---|
+| `NOMBRE.txt` | Transcripción formateada con cabecera y separadores por hablante |
+| `NOMBRE.json` | Transcripción estructurada con turnos y estadísticas |
+| `NOMBRE.wav` | 🔊 Audio de la llamada (ambos canales mezclados) |
+| `NOMBRE.mp4` | 🎬 Video sincronizado (solo si activaste grabación de pantalla) |
+
+Después de guardar, la app te ofrece borrar los archivos de trabajo de la sesión para liberar espacio. Si dices que no, se quedan por si quieres volver a transcribirla.
 
 ### 📄 Formato de la transcripción (.txt)
 ```
 ════════════════════════════════════════════════════════
-  OpenTralla v2.0 — Transcripción Profesional de Llamada
+  OpenTralla v2.2 — Transcripción de Llamada
   Fecha: 20/04/2026 15:30:45
   Duración: 00:45:23
   Motor: faster-whisper | Captura: Dual-channel WASAPI callback
@@ -132,7 +155,7 @@ Al primer inicio se descarga automáticamente el modelo de Whisper. Espera a que
 ### 📊 Formato JSON (.json)
 ```json
 {
-  "version": "2.0",
+  "version": "2.2",
   "app": "OpenTralla",
   "fecha": "2026-04-20T15:30:45",
   "duracion": "00:45:23",
@@ -152,20 +175,20 @@ Al primer inicio se descarga automáticamente el modelo de Whisper. Espera a que
 
 ## 🛡️ Sistema Anti-Pérdida
 
-OpenTralla guarda automáticamente la transcripción **cada 30 segundos** en la carpeta `_autosave/`:
-- Si la app se cierra inesperadamente, tu transcripción está segura
-- Se mantienen los últimos 3 auto-guardados (no llena el disco)
-- El indicador verde 🛡️ en la interfaz muestra la hora del último guardado
+- **El audio** se vuelca a disco cada 10 segundos mientras grabas. Si se cierra la app, se cuelga Windows o se va la luz, lo grabado hasta ese momento está a salvo.
+- **Al reabrir la app**, si encuentra una grabación que no llegaste a transcribir, te la ofrece para cargarla.
+- **La transcripción** se auto-guarda cada 30 segundos en `_autosave/` (se conservan las últimas 3 copias).
 
 ---
 
 ## 🎚️ Calibración del umbral VAD
 
-El **slider "Umbral"** en la barra inferior controla cuándo se considera que hay voz:
+> Solo afecta al modo **⚡ en vivo**. En modo grabadora no hay VAD: se graba todo.
+
+El **slider "Umbral"** controla cuándo se considera que hay voz:
 
 - **VU meter en cero todo el tiempo** → baja el slider
 - **Transcribe ruido de fondo** → sube el slider
-- Valor recomendado: el VU meter debe moverse con voz pero quedarse quieto en silencio
 
 ---
 
@@ -196,42 +219,34 @@ Las API keys se guardan localmente en `config.json` (excluido de git, nunca se s
 
 ## 🔬 Modelos de Whisper
 
+Se eligen desde el desplegable **⚙️ Modelo** de la barra inferior; la elección se guarda en `config.json`.
+
 | Modelo | Velocidad | Precisión | RAM extra | Recomendado para |
 |---|---|---|---|---|
 | `tiny` | ⚡ Súper veloz | Baja | ~400 MB | PC muy viejas |
 | `base` | ⚡ Veloz | Aceptable | ~500 MB | Pruebas rápidas |
-| **`small`** ✅ | 🟢 Rápido | Buena | ~1 GB | **CPU — fluido en tiempo real** |
+| **`small`** ✅ | 🟢 Rápido | Buena | ~1 GB | **Por defecto — buen equilibrio en CPU** |
 | `medium` | 🟡 Normal | Muy alta | ~2.5 GB | GPU NVIDIA recomendada |
-| `large-v3` | 🔴 Lento | Excelente | ~6 GB | Solo GPU NVIDIA |
 
-> **💡 Por defecto se usa `small`** — es fluido en CPU y tiene buena precisión. Si tienes GPU NVIDIA, puedes cambiar a `medium` o `large-v3` para máxima precisión.
+> Como ahora la transcripción va **después** de la llamada, puedes permitirte un modelo más grande sin miedo a estropear el audio: ya no compite con Zoom por la CPU.
 
-### Cambiar modelo
-
-Edita en `transcriptor.py`:
-```python
-MODEL_SIZE = "small"   # Cambia a "medium" o "large-v3" si tienes GPU
-```
-
-### Usar GPU NVIDIA (más rápido)
-
-```python
-whisper_model = WhisperModel(MODEL_SIZE, device="cuda", compute_type="float16")
-```
+Si tienes una GPU NVIDIA con CUDA, OpenTralla la detecta y la usa sola.
 
 ---
 
 ## 🔧 Diarización: cómo funciona
 
-Sin herramientas externas ni modelos extra — **detección inteligente por ratios adaptativos**:
+Sin herramientas externas ni modelos extra — **detección por ratios adaptativos**:
 
 - **`[Tú]`** → el micrófono tiene actividad significativa relativa al loopback
 - **`[Ellos]`** → solo el loopback tiene actividad (o el mic solo capta eco débil)
 - **Sin etiqueta** → sin micrófono conectado
 
-> **Nota técnica:** El audio digital del loopback siempre es más fuerte que un micrófono analógico. OpenTralla compensa esto usando ratios de actividad en vez de comparar volúmenes absolutos.
+> **Nota técnica:** el audio digital del loopback siempre es más fuerte que un micrófono analógico. OpenTralla compensa usando ratios de actividad en vez de comparar volúmenes absolutos.
 
-Para mejorar la diarización: asegúrate de que tu micrófono esté configurado como dispositivo de entrada predeterminado en Windows.
+En modo diferido la diarización se hace por franjas de tiempo sobre la grabación completa, comparando la actividad de cada canal en el tramo de cada frase.
+
+Para mejorarla: asegúrate de que tu micrófono sea el dispositivo de entrada predeterminado en Windows.
 
 ---
 
@@ -239,13 +254,17 @@ Para mejorar la diarización: asegúrate de que tu micrófono esté configurado 
 
 | Problema | Solución |
 |---|---|
-| No transcribe nada | Baja el slider de umbral. Verifica que el VU meter se mueva |
-| Transcribe ruido | Sube el slider de umbral |
-| Se comen palabras | Normal en habla muy rápida; en llamadas normales es mínimo |
-| Solo captura un lado | Verifica el micrófono en Windows → Configuración → Sonido |
-| Modelo lento | Usa `small` (por defecto). `medium`/`large` necesitan GPU |
+| **La otra persona me oye robotizado o con cortes** | Apaga **⚡ Transcribir en vivo**. Si sigue igual, es tu diadema, no la app (ver abajo) |
+| Suena mal con diadema Bluetooth | Al usar su micrófono, Windows la pasa a modo *Manos libres* y baja la calidad. Es una limitación del Bluetooth: usa auriculares por cable para llamadas importantes |
+| No transcribe nada | ¿Pulsaste **📝 Transcribir** después de detener? En modo grabadora el texto no aparece durante la llamada |
+| No grabó el audio de la llamada | Verifica que el sonido salga por el dispositivo predeterminado de Windows |
+| Solo captura un lado | Activa el checkbox **🎤 Mi voz (mic)** y revisa el micrófono en Windows → Configuración → Sonido |
+| Transcribe ruido (modo en vivo) | Sube el slider de umbral |
+| La transcripción tarda mucho | Normal: es proporcional a la llamada. Usa un modelo más pequeño o pulsa ⏹ Cancelar |
+| Se perdió la grabación | Reabre la app: te ofrecerá la grabación pendiente. También está en `grabaciones/` |
+| Se perdió la transcripción | Revisa la carpeta `_autosave/` |
+| Se me llena el disco | Pulsa **📂 Grabaciones** y borra las sesiones viejas. Al guardar, la app también te ofrece limpiarlas |
 | Error de API IA | Verifica que la clave sea válida y que instalaste la librería |
-| Se perdió la transcripción | Revisa la carpeta `_autosave/` — tiene las últimas copias automáticas |
 
 ---
 
@@ -257,9 +276,26 @@ Para mejorar la diarización: asegúrate de que tu micrófono esté configurado 
 
 ---
 
+## 📜 Historial
+
+### v2.0 Pro — Reescritura del motor de audio
+
+Inspirada en técnicas de grabación de llamadas de **Twilio**, **Zoom** y call centers:
+
+| Problema en v1 | Solución en v2.0 |
+|---|---|
+| 🔴 **Chasquidos/crujidos** al iniciar grabación | ✅ **Modo Callback WASAPI** — el driver entrega datos sin bloqueo |
+| 🔴 Buffer de 512 frames causaba **underruns** | ✅ Buffer de **2048 frames** |
+| 🔴 Resampleo forzado a 16 kHz **destruía calidad** | ✅ Captura a **tasa nativa** del dispositivo |
+| 🔴 **Se perdía tu voz** — la cancelación de eco rompía la señal | ✅ **Detección por ratios adaptativos** |
+| 🔴 Pop/clic al presionar Iniciar | ✅ **Fade-in de 15 ms** anti-pop |
+| 🔴 Transcripción plana sin formato | ✅ **Formato con separadores** + **JSON estructurado** |
+
+---
+
 ## 🤝 Contribuciones (Open Source)
 
-¡Este proyecto es 100% de código abierto (*Open Source*)! 
-Si tienes ideas para mejorar OpenTralla, has encontrado algún error, o quieres agregar nuevas y geniales funcionalidades, ¡tus contribuciones son más que bienvenidas! 
+¡Este proyecto es 100% de código abierto (*Open Source*)!
+Si tienes ideas para mejorar OpenTralla, has encontrado algún error, o quieres agregar nuevas y geniales funcionalidades, ¡tus contribuciones son más que bienvenidas!
 
 Siéntete libre de hacer un *fork* del repositorio, trabajar en tus mejoras y enviar un *Pull Request*. ¡Hagamos crecer esta herramienta juntos!

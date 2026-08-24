@@ -24,6 +24,9 @@ opentralla_*.json
 # Auto-guardado (transcripciones temporales anti-pérdida)
 _autosave/
 
+# Grabaciones de llamadas (audio crudo, pesan mucho y son privadas)
+grabaciones/
+
 # Configuración local (API keys) — nunca subir al repositorio
 config.json
 
