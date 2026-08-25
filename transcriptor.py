@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-OpenTralla - Grabadora + Transcriptor de Llamadas v2.2
+OpenTralla - Grabadora + Transcriptor de Llamadas v2.3
 ══════════════════════════════════════════════════════
 Flujo por defecto: GRABAR primero, TRANSCRIBIR después.
 Durante la llamada solo se graba audio — nada de Whisper, nada de VAD — para
@@ -108,7 +108,14 @@ SILENCE_THRESH = 0.003                  # Umbral VAD por defecto
 FADE_IN_MS     = 15                     # Duración del fade-in anti-pop (ms)
 AUTOSAVE_INTERVAL = 30                  # Segundos entre auto-guardados
 SYNC_INTERVAL  = 10                     # Segundos entre volcados forzados a disco
-HUECO_MIN_SEG  = 0.5                    # Hueco mínimo que se rellena con silencio
+HUECO_MIN_SEG  = 0.25                   # Hueco mínimo que se rellena con silencio.
+# 0.25 s va holgado sobre el jitter normal (los chunks llegan cada ~43 ms) y
+# corrige el desfase de arranque entre mic y loopback, que abren en instantes
+# distintos y dejaban los dos canales hasta 0.5 s descuadrados.
+SIN_AUDIO_AVISO = 5                     # Segundos sin recibir audio antes de avisar
+SIN_AUDIO_REPITE = 30                   # Cada cuánto se repite ese aviso
+MIC_MUDO_RATIO = 0.25                   # Ceros digitales que delatan un mic silenciado
+MIC_MUDO_MIN_SEG = 20                   # Audio mínimo antes de juzgar al micrófono
 VACIO_F32      = np.zeros(0, dtype=np.float32)
 
 # ─── Estado global ─────────────────────────────────────────────────────────────
@@ -252,8 +259,14 @@ def apply_fade_in(audio: np.ndarray, rate: int, duration_ms: int = FADE_IN_MS) -
 # genera al guardar, leyendo por bloques.
 
 def f32_a_pcm16(a: np.ndarray) -> np.ndarray:
-    """float32 [-1,1] → PCM int16."""
-    return np.clip(a * 32767.0, -32768, 32767).astype(np.int16)
+    """float32 [-1,1] → PCM int16.
+
+    Se REDONDEA, no se trunca: astype() por sí solo corta hacia cero y se come
+    el bit menos significativo, convirtiendo el suelo de ruido en ceros exactos.
+    Eso añade distorsión en los pasajes flojos y además falsearía la detección
+    de micrófono silenciado.
+    """
+    return np.clip(np.rint(a * 32767.0), -32768, 32767).astype(np.int16)
 
 
 def _leer_bloques_pcm(path: str, muestras: int):
@@ -309,6 +322,8 @@ class SesionGrabacion:
         self._t0       = None   # reloj de referencia para mantener la sincronía
         self._n_loop   = 0      # muestras escritas en ellos.pcm
         self._n_mic    = 0      # muestras escritas en tu.pcm
+        self.mic_muestras = 0   # muestras reales llegadas del micrófono
+        self.mic_ceros    = 0   # cuántas de ellas eran cero digital exacto
 
     # ── creación / apertura ──
     @staticmethod
@@ -351,6 +366,7 @@ class SesionGrabacion:
             self._f_mic  = open(self.path_mic, "wb") if mic_ok else None
             self._t0     = time.monotonic()
             self._n_loop = self._n_mic = 0
+            self.mic_muestras = self.mic_ceros = 0
         self._guardar_meta()
 
     def _guardar_meta(self):
@@ -406,7 +422,13 @@ class SesionGrabacion:
                 self._n_mic += self._rellenar(self._f_mic, self._n_mic,
                                               self.rate_mic, transcurrido, len(mic_c))
                 if len(mic_c) > 0:
-                    self._f_mic.write(f32_a_pcm16(mic_c).tobytes())
+                    pcm = f32_a_pcm16(mic_c)
+                    # Un micrófono real SIEMPRE entrega suelo de ruido. Si llega
+                    # cero digital exacto es que algo lo está silenciando por
+                    # software (cancelación de ruido con IA, mute, un efecto).
+                    self.mic_muestras += len(pcm)
+                    self.mic_ceros    += int(np.count_nonzero(pcm == 0))
+                    self._f_mic.write(pcm.tobytes())
                     self._n_mic += len(mic_c)
 
     def sincronizar(self):
@@ -446,6 +468,17 @@ class SesionGrabacion:
 
     def tiene_audio(self) -> bool:
         return self.n_loop() > 0 or self.n_mic() > 0
+
+    def mic_silenciado(self) -> float:
+        """Proporción de cero digital exacto que ha entregado el micrófono.
+
+        Por encima de ~0.25 el micrófono no está grabando sonido de verdad:
+        algo lo está recortando y la voz sale entrecortada («robotizada»)
+        tanto en la grabación como en la videollamada.
+        """
+        if self.mic_muestras < MIC_MUDO_MIN_SEG * self.rate_mic:
+            return 0.0
+        return self.mic_ceros / self.mic_muestras
 
     def duracion_seg(self) -> float:
         d_loop = self.n_loop() / self.rate_loop if self.rate_loop else 0.0
@@ -774,8 +807,11 @@ def hilo_captura(status_cb, rms_cb, usar_mic=True, live=False, sesion=None):
     
     reconnect_attempts = 0
     max_reconnect_attempts = 5
-    last_vu     = 0.0   # limita los refrescos del VU meter (no saturar el hilo Tk)
-    ultimo_sync = 0.0   # último volcado forzado a disco
+    last_vu      = 0.0   # limita los refrescos del VU meter (no saturar el hilo Tk)
+    ultimo_sync  = 0.0   # último volcado forzado a disco
+    ultimo_audio = time.monotonic()   # última vez que llegó audio de verdad
+    ultimo_grito = 0.0   # última vez que avisamos de que no llega nada
+    aviso_mic    = False # ya avisamos de micrófono silenciado
     
     try:
         while not stop_event.is_set():
@@ -822,10 +858,27 @@ def hilo_captura(status_cb, rms_cb, usar_mic=True, live=False, sesion=None):
             loop_chunks, mic_chunks = engine.get_chunks()
             
             if not loop_chunks and not mic_chunks:
-                # Sin datos aún, esperar un poco
+                # No llega nada. Aun así hay que tocar la sesión: el relleno
+                # mantiene la línea de tiempo, y la vigilancia avisa en pantalla
+                # para que la grabación no se quede muda «por detrás» sin que
+                # nadie se entere (que es justo lo que pasó el 24/08).
+                if sesion is not None:
+                    sesion.escribir(VACIO_F32, VACIO_F32)
+                ahora = time.monotonic()
+                mudo = ahora - ultimo_audio
+                if mudo >= SIN_AUDIO_AVISO and ahora - ultimo_grito >= SIN_AUDIO_REPITE:
+                    status_cb(f"⚠️ NO LLEGA AUDIO desde hace {int(mudo)}s — "
+                              "revisa el micrófono y el sonido del sistema")
+                    ultimo_grito = ahora
                 time.sleep(0.01)
                 continue
             
+            # Sí llegó audio: reiniciar la vigilancia
+            if ultimo_grito:
+                status_cb("🔴 Grabando — el audio volvió")
+                ultimo_grito = 0.0
+            ultimo_audio = time.monotonic()
+
             # Concatenar chunks del período
             loop_c = np.concatenate(loop_chunks) if loop_chunks else np.zeros(0, dtype=np.float32)
             mic_c  = np.concatenate(mic_chunks)  if mic_chunks  else np.zeros(0, dtype=np.float32)
@@ -855,6 +908,14 @@ def hilo_captura(status_cb, rms_cb, usar_mic=True, live=False, sesion=None):
             if ahora - last_vu >= 0.08:
                 rms_cb(level)
                 last_vu = ahora
+
+            # ── ¿El micrófono está entregando silencio digital? ──
+            if (not aviso_mic and sesion is not None and engine.mic_ok
+                    and sesion.mic_silenciado() > MIC_MUDO_RATIO):
+                aviso_mic = True
+                pct = int(sesion.mic_silenciado() * 100)
+                status_cb(f"⚠️ Tu micrófono entrega {pct}% de silencio digital — "
+                          "desactiva la cancelación de ruido con IA (tu voz sale cortada)")
 
             # ── MODO GRABADORA ──
             # Sin transcripción en vivo el hilo termina aquí: no hay VAD,
@@ -1566,7 +1627,7 @@ class TranscriptorApp:
         self._cargando_modelo = False
         self.sesion           = None    # SesionGrabacion en curso o cargada
         self._hilo_captura    = None
-        root.title("🐌 OpenTralla — Grabadora + Transcriptor v2.2")
+        root.title("🐌 OpenTralla — Grabadora + Transcriptor v2.3")
         root.geometry("960x700")
         root.minsize(700, 540)
         root.configure(bg=self.BG)
@@ -1588,7 +1649,7 @@ class TranscriptorApp:
         # Encabezado
         hdr = tk.Frame(self.root, bg=C.ACCENT, pady=11)
         hdr.pack(side="top", fill="x")
-        tk.Label(hdr, text="🐌  OpenTralla v2.2",
+        tk.Label(hdr, text="🐌  OpenTralla v2.3",
                  font=("Segoe UI",15,"bold"), fg=C.FG, bg=C.ACCENT).pack(side="left", padx=16)
         tk.Label(hdr, text="Graba primero, transcribe después  |  Dual-Channel  |  100% local",
                  font=F, fg=C.MUTED, bg=C.ACCENT).pack(side="left")
@@ -1721,7 +1782,7 @@ class TranscriptorApp:
         device_info = "GPU CUDA" if device == "cuda" else f"CPU ({WHISPER_THREADS} hilos)"
         self.lbl_motor_info = tk.Label(
             vu_frame,
-            text=f"Motor: faster-whisper {MODEL_SIZE} ({device_info})  |  [Tú]=azul  [Ellos]=verde  |  🐌 OpenTralla v2.2",
+            text=f"Motor: faster-whisper {MODEL_SIZE} ({device_info})  |  [Tú]=azul  [Ellos]=verde  |  🐌 OpenTralla v2.3",
             font=("Segoe UI",8), fg=C.MUTED, bg="#0f1b30"
         )
         self.lbl_motor_info.pack(pady=(2,0))
@@ -1805,7 +1866,7 @@ class TranscriptorApp:
         
         header = (
             "════════════════════════════════════════════════════════════════\n"
-            "  OpenTralla v2.2 — Transcripción de Llamada\n"
+            "  OpenTralla v2.3 — Transcripción de Llamada\n"
             f"  Fecha: {datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n"
         )
         if duracion:
@@ -1852,7 +1913,7 @@ class TranscriptorApp:
             duracion = f"{horas:02d}:{mins:02d}:{secs:02d}"
         
         return {
-            "version": "2.2",
+            "version": "2.3",
             "app": "OpenTralla",
             "fecha": datetime.datetime.now().isoformat(),
             "duracion": duracion,
@@ -1993,6 +2054,45 @@ class TranscriptorApp:
             if not LIVE_TRANSCRIBE:
                 self._status(f"✅ Grabación lista ({mins:.1f} min) — "
                              "pulsa «📝 Transcribir» cuando quieras")
+            self._avisar_calidad()
+
+    def _avisar_calidad(self):
+        """Avisa al colgar si la grabación salió comprometida.
+
+        Vale mucho más enterarse ahora que descubrirlo media hora después,
+        o peor, que te lo diga la persona con la que hablabas.
+        """
+        s = self.sesion
+        if s is None:
+            return
+        problemas = []
+
+        ratio = s.mic_silenciado()
+        if ratio > MIC_MUDO_RATIO:
+            problemas.append(
+                f"🎤 Tu micrófono entregó {int(ratio*100)}% de silencio digital.\n\n"
+                "Un micrófono real nunca da silencio absoluto: algo lo está\n"
+                "recortando por software. Casi siempre es la cancelación de\n"
+                "ruido con IA del portátil.\n\n"
+                "En MyASUS → Audio y visual → «Micrófono con cancelación de\n"
+                "ruido con IA», elige «Grabación auténtica».\n\n"
+                "OJO: con eso activo tu voz sale entrecortada TAMBIÉN para la\n"
+                "persona con la que hablas, no solo en la grabación.")
+
+        esperado = 0.0
+        if self._start_time and self._end_time:
+            esperado = (self._end_time - self._start_time).total_seconds()
+        real = s.duracion_seg()
+        if esperado > 60 and real < esperado * 0.9:
+            problemas.append(
+                f"⏱️ Se perdió grabación: {real/60:.1f} min de los "
+                f"{esperado/60:.1f} min que estuvo grabando.\n\n"
+                "El sistema dejó de entregar audio, normalmente porque se quedó\n"
+                "sin memoria o sin CPU. Cierra pestañas de Chrome antes de la\n"
+                "próxima llamada.")
+
+        if problemas:
+            messagebox.showwarning("Revisa esta grabación", "\n\n────────\n\n".join(problemas))
 
     def _cargar_modelo_async(self):
         self._cargando_modelo = True
@@ -2004,7 +2104,7 @@ class TranscriptorApp:
             if "✅" in msg or "❌" in msg:
                 device, _ = get_whisper_device()
                 device_info = "GPU CUDA" if device == "cuda" else f"CPU ({WHISPER_THREADS} hilos)"
-                motor_info = f"Motor: faster-whisper {MODEL_SIZE} ({device_info})  |  [Tú]=azul  [Ellos]=verde  |  🐌 OpenTralla v2.2"
+                motor_info = f"Motor: faster-whisper {MODEL_SIZE} ({device_info})  |  [Tú]=azul  [Ellos]=verde  |  🐌 OpenTralla v2.3"
                 self.root.after(0, lambda info=motor_info: self.lbl_motor_info.config(text=info))
                 self._cargando_modelo = False
                 self.root.after(0, self._estado_botones)
@@ -2116,6 +2216,9 @@ class TranscriptorApp:
     def _revisar_pendientes(self):
         """Al abrir la app: ofrecer la última grabación que quedó sin transcribir.
         Es lo que te salva si la app se cerró sola o se fue la luz."""
+        # Nunca pisar una grabación en curso o ya cargada
+        if self.grabando or self._transcribiendo or self.sesion is not None:
+            return
         try:
             pendientes = sesiones_pendientes()
         except Exception:

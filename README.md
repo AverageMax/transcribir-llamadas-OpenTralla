@@ -1,4 +1,4 @@
-# 🐌 OpenTralla v2.2 — Grabadora + Transcriptor de Llamadas
+# 🐌 OpenTralla v2.3 — Grabadora + Transcriptor de Llamadas
 
 ![OpenTralla Interfaz](screenshot.png)
 
@@ -63,6 +63,7 @@ Activa **⚡ Transcribir en vivo** antes de empezar. Ten en cuenta que Whisper c
 | 🔊 **Tasa Nativa** | Captura a la tasa real del dispositivo (44100/48000 Hz) — sin resampleo destructivo |
 | 🔗 **Streams sincronizados** | Se rellenan con silencio los tramos en que el sistema no reproduce nada |
 | 🛡️ **Anti-Pérdida** | Volcado a disco cada 10 s + recuperación de grabaciones pendientes al abrir |
+| 🚨 **Vigilancia** | Avisa si deja de llegar audio o si algo está recortando tu micrófono |
 | 🎬 **Grabar Pantalla** | Captura de video opcional de la zona que elijas (redimensionable) |
 | 🤖 **Análisis con IA** | Resumir, extraer puntos clave o tareas con Gemini, Claude, OpenAI u Ollama |
 | 📊 **VU meter** | Visualiza el nivel de audio en tiempo real |
@@ -139,7 +140,7 @@ Después de guardar, la app te ofrece borrar los archivos de trabajo de la sesi�
 ### 📄 Formato de la transcripción (.txt)
 ```
 ════════════════════════════════════════════════════════
-  OpenTralla v2.2 — Transcripción de Llamada
+  OpenTralla v2.3 — Transcripción de Llamada
   Fecha: 20/04/2026 15:30:45
   Duración: 00:45:23
   Motor: faster-whisper | Captura: Dual-channel WASAPI callback
@@ -155,7 +156,7 @@ Después de guardar, la app te ofrece borrar los archivos de trabajo de la sesi�
 ### 📊 Formato JSON (.json)
 ```json
 {
-  "version": "2.2",
+  "version": "2.3",
   "app": "OpenTralla",
   "fecha": "2026-04-20T15:30:45",
   "duracion": "00:45:23",
@@ -250,11 +251,72 @@ Para mejorarla: asegúrate de que tu micrófono sea el dispositivo de entrada pr
 
 ---
 
+## 🎤 Si tu voz se oye robotizada o entrecortada
+
+**Casi nunca es OpenTralla.** Lo más habitual es que algo esté recortando el micrófono
+por software *antes* de que ninguna aplicación lo reciba — y entonces sale entrecortado
+igual en la videollamada que en la grabación.
+
+### Cómo se reconoce
+
+Un micrófono real **nunca** entrega silencio absoluto: siempre hay algo de suelo de ruido.
+Si en la grabación aparecen tramos de cero digital exacto, hay una puerta de software
+cortando la señal. Caso medido en un ASUS Vivobook X1605VA:
+
+| Grabación | Silencio digital absoluto |
+|---|---|
+| Micrófono sano | **0,0 – 0,5 %** |
+| Micrófono recortado por IA | **39,7 %** (≈9 cortes por segundo) |
+
+Desde v2.3 OpenTralla lo detecta solo y te avisa al pulsar **⏹ Detener**.
+
+### Cómo se arregla
+
+**MyASUS → Audio y visual → «Micrófono con cancelación de ruido con IA» → «Grabación auténtica».**
+
+El propio panel de ASUS lo advierte: *«Para la grabación de vídeo, establezca el micrófono
+con cancelación de ruido IA en Desactivado»*. El modo **Presentador único** es el más
+agresivo: silencia todo lo que su IA no reconozca como «el presentador», y se lleva por
+delante trozos de tus palabras.
+
+Otros sospechosos, en orden: efectos de audio de Windows (Configuración → Sonido →
+Propiedades del dispositivo → Mejoras), la supresión de ruido de la propia app de
+videollamada (Meet/Zoom/Teams), y diademas Bluetooth (al usar su micrófono Windows las
+pasa a modo *Manos libres*, que suena mal por diseño).
+
+---
+
+## 🧠 Si el PC se atasca durante la llamada
+
+En modo grabadora OpenTralla apenas usa CPU y su memoria no crece: el audio va a disco
+según entra. Si aun así el equipo se atasca, mira quién se está comiendo la RAM —
+normalmente Chrome con muchas pestañas abiertas.
+
+Para comprobarlo, en PowerShell:
+
+```powershell
+Get-WinEvent -FilterHashtable @{LogName='System'
+  ProviderName='Microsoft-Windows-Resource-Exhaustion-Detector'} -MaxEvents 5 |
+  Format-List TimeCreated, Message
+```
+
+Windows nombra ahí los tres procesos que más memoria virtual consumieron. Cuando el
+sistema se queda sin memoria, el audio en tiempo real es lo primero que se rompe: la
+videollamada empieza a sonar entrecortada y la captura se queda sin datos.
+
+Desde v2.3, si deja de llegar audio OpenTralla lo grita en pantalla en vez de seguir
+mostrando «REC» sin grabar nada, y al detener te dice cuántos minutos se perdieron.
+
+---
+
 ## 🛠️ Solución de problemas
 
 | Problema | Solución |
 |---|---|
-| **La otra persona me oye robotizado o con cortes** | Apaga **⚡ Transcribir en vivo**. Si sigue igual, es tu diadema, no la app (ver abajo) |
+| **La otra persona me oye robotizado o con cortes** | Ver la sección **🎤 Si tu voz se oye robotizada** de arriba. Suele ser la cancelación de ruido con IA del portátil |
+| **El PC se atascó / Chrome sin memoria** | Ver **🧠 Si el PC se atasca durante la llamada**. Cierra pestañas antes de llamar |
+| Sale el aviso «tu micrófono entrega X% de silencio digital» | Algo recorta el micrófono por software. MyASUS → «Grabación auténtica» |
+| Sale el aviso «NO LLEGA AUDIO» | El sistema dejó de entregar audio: falta de memoria o CPU, o el dispositivo cambió |
 | Suena mal con diadema Bluetooth | Al usar su micrófono, Windows la pasa a modo *Manos libres* y baja la calidad. Es una limitación del Bluetooth: usa auriculares por cable para llamadas importantes |
 | No transcribe nada | ¿Pulsaste **📝 Transcribir** después de detener? En modo grabadora el texto no aparece durante la llamada |
 | No grabó el audio de la llamada | Verifica que el sonido salga por el dispositivo predeterminado de Windows |
