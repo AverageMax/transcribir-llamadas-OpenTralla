@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-OpenTralla - Grabadora + Transcriptor de Llamadas v2.3
+OpenTralla - Grabadora + Transcriptor de Llamadas v2.4
 ══════════════════════════════════════════════════════
 Flujo por defecto: GRABAR primero, TRANSCRIBIR después.
 Durante la llamada solo se graba audio — nada de Whisper, nada de VAD — para
@@ -938,7 +938,23 @@ def hilo_captura(status_cb, rms_cb, usar_mic=True, live=False, sesion=None):
                     mic_c_aligned = np.zeros(0, dtype=np.float32)
             else:
                 mic_c_aligned = mic_c
-            
+
+            # ── Los dos streams tienen que avanzar a la vez ──
+            # WASAPI no entrega ni un paquete de loopback mientras el sistema no
+            # reproduce nada. El VAD medía el tiempo con len(loop_c), así que al
+            # hablar tú a solas el contador de silencio no avanzaba nunca: la
+            # frase no se cerraba y NO llegaba nada a Whisper (la ventana se
+            # quedaba en blanco). Rellenando el que venga corto, el reloj del VAD
+            # avanza siempre y ambos buffers quedan alineados, que además evita
+            # que _prepare_audio_for_whisper recorte la frase al más corto.
+            n_periodo = max(len(loop_c), len(mic_c_aligned))
+            if len(loop_c) < n_periodo:
+                loop_c = np.concatenate(
+                    [loop_c, np.zeros(n_periodo - len(loop_c), dtype=np.float32)])
+            if len(mic_c_aligned) < n_periodo:
+                mic_c_aligned = np.concatenate(
+                    [mic_c_aligned, np.zeros(n_periodo - len(mic_c_aligned), dtype=np.float32)])
+
             if level >= thresh:                      # ── VOZ ──
                 # SIEMPRE guardar el RMS real de ambos streams
                 rms_loop_acc.append(rms_loop_now)
@@ -1627,7 +1643,7 @@ class TranscriptorApp:
         self._cargando_modelo = False
         self.sesion           = None    # SesionGrabacion en curso o cargada
         self._hilo_captura    = None
-        root.title("🐌 OpenTralla — Grabadora + Transcriptor v2.3")
+        root.title("🐌 OpenTralla — Grabadora + Transcriptor v2.4")
         root.geometry("960x700")
         root.minsize(700, 540)
         root.configure(bg=self.BG)
@@ -1649,7 +1665,7 @@ class TranscriptorApp:
         # Encabezado
         hdr = tk.Frame(self.root, bg=C.ACCENT, pady=11)
         hdr.pack(side="top", fill="x")
-        tk.Label(hdr, text="🐌  OpenTralla v2.3",
+        tk.Label(hdr, text="🐌  OpenTralla v2.4",
                  font=("Segoe UI",15,"bold"), fg=C.FG, bg=C.ACCENT).pack(side="left", padx=16)
         tk.Label(hdr, text="Graba primero, transcribe después  |  Dual-Channel  |  100% local",
                  font=F, fg=C.MUTED, bg=C.ACCENT).pack(side="left")
@@ -1782,7 +1798,7 @@ class TranscriptorApp:
         device_info = "GPU CUDA" if device == "cuda" else f"CPU ({WHISPER_THREADS} hilos)"
         self.lbl_motor_info = tk.Label(
             vu_frame,
-            text=f"Motor: faster-whisper {MODEL_SIZE} ({device_info})  |  [Tú]=azul  [Ellos]=verde  |  🐌 OpenTralla v2.3",
+            text=f"Motor: faster-whisper {MODEL_SIZE} ({device_info})  |  [Tú]=azul  [Ellos]=verde  |  🐌 OpenTralla v2.4",
             font=("Segoe UI",8), fg=C.MUTED, bg="#0f1b30"
         )
         self.lbl_motor_info.pack(pady=(2,0))
@@ -1866,7 +1882,7 @@ class TranscriptorApp:
         
         header = (
             "════════════════════════════════════════════════════════════════\n"
-            "  OpenTralla v2.3 — Transcripción de Llamada\n"
+            "  OpenTralla v2.4 — Transcripción de Llamada\n"
             f"  Fecha: {datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n"
         )
         if duracion:
@@ -1913,7 +1929,7 @@ class TranscriptorApp:
             duracion = f"{horas:02d}:{mins:02d}:{secs:02d}"
         
         return {
-            "version": "2.3",
+            "version": "2.4",
             "app": "OpenTralla",
             "fecha": datetime.datetime.now().isoformat(),
             "duracion": duracion,
@@ -2104,7 +2120,7 @@ class TranscriptorApp:
             if "✅" in msg or "❌" in msg:
                 device, _ = get_whisper_device()
                 device_info = "GPU CUDA" if device == "cuda" else f"CPU ({WHISPER_THREADS} hilos)"
-                motor_info = f"Motor: faster-whisper {MODEL_SIZE} ({device_info})  |  [Tú]=azul  [Ellos]=verde  |  🐌 OpenTralla v2.3"
+                motor_info = f"Motor: faster-whisper {MODEL_SIZE} ({device_info})  |  [Tú]=azul  [Ellos]=verde  |  🐌 OpenTralla v2.4"
                 self.root.after(0, lambda info=motor_info: self.lbl_motor_info.config(text=info))
                 self._cargando_modelo = False
                 self.root.after(0, self._estado_botones)

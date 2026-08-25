@@ -1,4 +1,4 @@
-# 🐌 OpenTralla v2.3 — Grabadora + Transcriptor de Llamadas
+# 🐌 OpenTralla v2.4 — Grabadora + Transcriptor de Llamadas
 
 ![OpenTralla Interfaz](screenshot.png)
 
@@ -140,7 +140,7 @@ Después de guardar, la app te ofrece borrar los archivos de trabajo de la sesi�
 ### 📄 Formato de la transcripción (.txt)
 ```
 ════════════════════════════════════════════════════════
-  OpenTralla v2.3 — Transcripción de Llamada
+  OpenTralla v2.4 — Transcripción de Llamada
   Fecha: 20/04/2026 15:30:45
   Duración: 00:45:23
   Motor: faster-whisper | Captura: Dual-channel WASAPI callback
@@ -156,7 +156,7 @@ Después de guardar, la app te ofrece borrar los archivos de trabajo de la sesi�
 ### 📊 Formato JSON (.json)
 ```json
 {
-  "version": "2.3",
+  "version": "2.4",
   "app": "OpenTralla",
   "fecha": "2026-04-20T15:30:45",
   "duracion": "00:45:23",
@@ -322,6 +322,7 @@ mostrando «REC» sin grabar nada, y al detener te dice cuántos minutos se perd
 | No grabó el audio de la llamada | Verifica que el sonido salga por el dispositivo predeterminado de Windows |
 | Solo captura un lado | Activa el checkbox **🎤 Mi voz (mic)** y revisa el micrófono en Windows → Configuración → Sonido |
 | Transcribe ruido (modo en vivo) | Sube el slider de umbral |
+| En vivo no aparece texto en la ventana | Corregido en v2.4. Antes, si el sistema no reproducía sonido, el VAD se quedaba congelado y no llegaba nada a Whisper |
 | La transcripción tarda mucho | Normal: es proporcional a la llamada. Usa un modelo más pequeño o pulsa ⏹ Cancelar |
 | Se perdió la grabación | Reabre la app: te ofrecerá la grabación pendiente. También está en `grabaciones/` |
 | Se perdió la transcripción | Revisa la carpeta `_autosave/` |
